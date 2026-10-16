@@ -133,3 +133,88 @@ def fetch_market_index(ticker: str = "^TWII", period: str = "6mo") -> Optional[p
     except Exception as e:
         print(f"Error fetching market index {ticker}: {e}")
         return None
+
+def update_full_market_stocks(save_csv: bool = True) -> pd.DataFrame:
+    """
+    連線台灣證券交易所 (TWSE) 與證券櫃檯買賣中心 (TPEx) OpenAPI
+    自動下載並解析全市場所有上市櫃普通股 (約 1,979 檔)
+    """
+    import requests
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    all_stocks = []
+
+    # 1. TWSE 上市股票
+    try:
+        twse_url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+        r = requests.get(twse_url, headers=headers, timeout=15)
+        if r.status_code == 200:
+            for item in r.json():
+                code = str(item.get("Code", "")).strip()
+                name = str(item.get("Name", "")).strip()
+                if len(code) == 4 and code.isdigit():
+                    try:
+                        vol = float(str(item.get("TradeVolume", "0")).replace(",", "")) / 1000.0
+                    except Exception:
+                        vol = 0.0
+                    try:
+                        price = float(str(item.get("ClosingPrice", "0")).replace(",", ""))
+                    except Exception:
+                        price = 0.0
+                    all_stocks.append({
+                        "symbol": f"{code}.TW",
+                        "code": code,
+                        "name": name,
+                        "market": "TWSE (上市)",
+                        "industry": "上市普通股",
+                        "latest_vol_lots": round(vol, 1),
+                        "latest_close": price
+                    })
+    except Exception as e:
+        print(f"Error fetching TWSE stocks: {e}")
+
+    # 2. TPEx 上櫃股票
+    try:
+        tpex_url = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
+        r2 = requests.get(tpex_url, headers=headers, timeout=15)
+        if r2.status_code == 200:
+            for item in r2.json():
+                code = str(item.get("SecuritiesCompanyCode", "")).strip()
+                name = str(item.get("CompanyName", "")).strip()
+                if len(code) == 4 and code.isdigit():
+                    try:
+                        vol = float(str(item.get("TradingVolumeShares", "0")).replace(",", "")) / 1000.0
+                    except Exception:
+                        vol = 0.0
+                    try:
+                        price = float(str(item.get("Close", "0")).replace(",", ""))
+                    except Exception:
+                        price = 0.0
+                    all_stocks.append({
+                        "symbol": f"{code}.TWO",
+                        "code": code,
+                        "name": name,
+                        "market": "TPEx (上櫃)",
+                        "industry": "上櫃普通股",
+                        "latest_vol_lots": round(vol, 1),
+                        "latest_close": price
+                    })
+    except Exception as e:
+        print(f"Error fetching TPEx stocks: {e}")
+
+    if not all_stocks:
+        # 若連線受限，讀取現存 CSV
+        if os.path.exists("stocks_all_market.csv"):
+            return pd.read_csv("stocks_all_market.csv")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_stocks)
+    if save_csv:
+        df.to_csv("stocks_all_market.csv", index=False, encoding="utf-8-sig")
+        # 篩選活躍熱門股
+        active_df = df[(df["latest_vol_lots"] >= 500) & (df["latest_close"] >= 15.0)].copy()
+        active_df.sort_values(by="latest_vol_lots", ascending=False, inplace=True)
+        active_df.to_csv("stocks_active_hot.csv", index=False, encoding="utf-8-sig")
+
+    return df

@@ -208,12 +208,52 @@ def main():
     st.sidebar.subheader("1. 股票資料來源")
     stock_source = st.sidebar.radio(
         "股票池來源",
-        ["內建熱門與台灣50成分股", "上傳自訂 CSV", "手動輸入代號清單"],
+        [
+            "🔥 全市場熱門活躍股 (約 525 檔，日量>=500張，推薦)",
+            "🌐 全市場上市櫃所有股票 (全市場 1,979 檔)",
+            "⚡ 內建精選與台灣50核心 (53 檔，極速秒開)",
+            "📂 上傳自訂 CSV",
+            "✍️ 手動輸入代號清單"
+        ],
         index=0
     )
 
     metadata_df = pd.DataFrame()
-    if stock_source == "內建熱門與台灣50成分股":
+
+    if "全市場熱門活躍股" in stock_source:
+        if os.path.exists("stocks_active_hot.csv"):
+            metadata_df = pd.read_csv("stocks_active_hot.csv")
+        else:
+            metadata_df = load_stock_metadata("stocks_default.csv")
+        
+        limit_count = st.sidebar.slider("掃描活躍股票數量上限", min_value=50, max_value=len(metadata_df), value=min(300, len(metadata_df)), step=50)
+        metadata_df = metadata_df.head(limit_count)
+
+    elif "全市場上市櫃所有股票" in stock_source:
+        if os.path.exists("stocks_all_market.csv"):
+            all_df = pd.read_csv("stocks_all_market.csv")
+        else:
+            all_df = load_stock_metadata("stocks_default.csv")
+
+        market_filter_sel = st.sidebar.selectbox("市場類別篩選", ["全部上市櫃 (1,979檔)", "僅上市股票 (TWSE)", "僅上櫃股票 (TPEx)"])
+        if "僅上市" in market_filter_sel:
+            all_df = all_df[all_df["market"].str.contains("TWSE", na=False)]
+        elif "僅上櫃" in market_filter_sel:
+            all_df = all_df[all_df["market"].str.contains("TPEx", na=False)]
+
+        scan_scope = st.sidebar.select_slider(
+            "掃描檔數上限 (依流動性排序，避免超時)",
+            options=[100, 250, 500, 1000, "全部掃描"],
+            value=250,
+            help="短線交易需優先過濾低成交量殭屍股，建議先掃描成交量居前之個股"
+        )
+        if scan_scope != "全部掃描":
+            all_df.sort_values(by="latest_vol_lots", ascending=False, inplace=True)
+            metadata_df = all_df.head(int(scan_scope))
+        else:
+            metadata_df = all_df
+
+    elif "內建精選與台灣50核心" in stock_source:
         default_meta = load_stock_metadata("stocks_default.csv")
         sub_category = st.sidebar.selectbox(
             "選擇類別分類",
@@ -230,7 +270,7 @@ def main():
         else:
             metadata_df = default_meta
 
-    elif stock_source == "上傳自訂 CSV":
+    elif "上傳自訂 CSV" in stock_source:
         uploaded_file = st.sidebar.file_uploader("上傳 CSV (需包含 symbol 欄位)", type=["csv"])
         if uploaded_file is not None:
             try:
@@ -259,6 +299,18 @@ def main():
         })
 
     st.sidebar.markdown(f"**當前股票池數量：** `{len(metadata_df)}` 檔")
+
+    with st.sidebar.expander("🔄 證交所/櫃買全市場名單更新"):
+        st.caption("自動連線台灣證券交易所 (TWSE) 與櫃買中心 (TPEx) OpenAPI 抓取最新普通股。")
+        if st.button("立即連線更新全市場名單", use_container_width=True):
+            with st.spinner("正在連線證交所與櫃買中心下載中..."):
+                try:
+                    from data_loader import update_full_market_stocks
+                    res_df = update_full_market_stocks(save_csv=True)
+                    st.success(f"更新完成！共取得 {len(res_df)} 檔上市櫃股票。")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"更新失敗: {e}")
 
     # 2. 基礎流動性過濾
     st.sidebar.subheader("2. 基礎流動性過濾（必要）")
