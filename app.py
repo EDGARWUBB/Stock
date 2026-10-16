@@ -4,15 +4,67 @@ import numpy as np
 import datetime
 import json
 import os
-from data_loader import load_stock_metadata, fetch_stock_data, fetch_market_index, calculate_technical_indicators
-from strategies import (
-    filter_liquidity,
-    strategy_a_breakdown_reversal,
-    strategy_b_consolidation_breakout,
-    strategy_c_pullback_support,
-    check_market_filter,
-    scan_single_stock
-)
+# 載入自訂模組並加入相容性保護 (防止雲端未同步更新所有檔案時拋出 ImportError)
+import yfinance as yf
+from data_loader import load_stock_metadata, fetch_stock_data, calculate_technical_indicators
+
+try:
+    from data_loader import fetch_market_index
+except ImportError:
+    def fetch_market_index(ticker: str = "^TWII", period: str = "6mo"):
+        try:
+            t = yf.Ticker(ticker)
+            df = t.history(period=period, auto_adjust=False)
+            if df is None or df.empty or len(df) < 20:
+                return None
+            if df.index.tz is not None:
+                df.index = df.index.tz_localize(None)
+            df.sort_index(ascending=True, inplace=True)
+            df["MA5"] = df["Close"].rolling(window=5).mean()
+            df["MA10"] = df["Close"].rolling(window=10).mean()
+            df["MA20"] = df["Close"].rolling(window=20).mean()
+            df["MA60"] = df["Close"].rolling(window=60).mean()
+            df["Change_Pct"] = df["Close"].pct_change() * 100
+            df["Is_Red"] = df["Close"] > df["Open"]
+            return df
+        except Exception:
+            return None
+
+try:
+    from strategies import (
+        filter_liquidity,
+        strategy_a_breakdown_reversal,
+        strategy_a2_reversal_pullback,
+        strategy_b_consolidation_breakout,
+        strategy_c_pullback_support,
+        check_market_filter,
+        scan_single_stock
+    )
+except ImportError:
+    from strategies import (
+        filter_liquidity,
+        strategy_a_breakdown_reversal,
+        strategy_b_consolidation_breakout,
+        strategy_c_pullback_support,
+        scan_single_stock
+    )
+    def check_market_filter(market_df, mode="any"):
+        if market_df is None or len(market_df) < 65:
+            return True, {}
+        today = market_df.iloc[-1]
+        yest = market_df.iloc[-2]
+        close = float(today["Close"])
+        ma5_today = float(today.get("MA5", 0.0))
+        ma5_yest = float(yest.get("MA5", 0.0))
+        ma60_today = float(today.get("MA60", 0.0))
+        above_ma60 = close >= ma60_today
+        ma5_up = ma5_today >= ma5_yest
+        is_safe = (above_ma60 or ma5_up) if mode == "any" else (above_ma60 and ma5_up)
+        return is_safe, {"above_ma60": above_ma60, "ma5_up": ma5_up}
+
+    def strategy_a2_reversal_pullback(df, **kwargs):
+        return False, {"reason": "模組更新中"}
+
 from chart_plotter import plot_stock_kline
 
 # 設定頁面佈局與標題
