@@ -345,6 +345,163 @@ def strategy_c_pullback_support(
     return False, details
 
 
+def strategy_d_double_bottom(
+    df: pd.DataFrame,
+    l1_start_day: int = 30,
+    l1_end_day: int = 16,
+    l2_start_day: int = 10,
+    l2_end_day: int = 2,
+    min_interval_days: int = 7,
+    min_neckline_gain_pct: float = 6.0,
+    min_l2_ratio: float = -0.015,
+    max_l2_ratio: float = 0.035,
+    d1_max_distance_pct: float = 4.0,
+    d2_vol_multiplier: float = 1.8,
+    enable_d1: bool = True,
+    enable_d2: bool = True
+) -> Tuple[bool, Dict[str, Any]]:
+    """
+    策略 D：標準 W 底（雙重底）頸線突破與右腳轉強
+    時間區間切片法拆解過去 25 至 35 個交易日：
+    1. 左腳 (L1)：過去第 16 天至第 30 天區間最低價 L1_Price 與日期 L1_Date
+    2. 中間頸線峰位 (Neckline)：L1_Date 之後至過去第 5 天之間最高價，且空間幅度 >= 6%
+    3. 右腳 (L2)：過去第 2 天至第 10 天區間最低價 L2_Price，兩腳間隔 >= 7 天，L2 與 L1 差距在 -1.5% 至 +3.5% 之間
+    4. 量能結構：L2 成交量 < L1 成交量，或 L2 成交量 < 20 日均量 (量縮無沉重賣壓)
+    5. 觸發訊號：
+       - 模式 D-1 (右腳潛伏轉折)：今日收盤站上 5MA、收紅 K、距離 L2 幅度在 4% 內
+       - 模式 D-2 (帶量突破頸線)：今日收盤突破 Neckline、收紅 K、成交量 >= 5 日均量 1.8 倍
+    """
+    if df is None or len(df) < max(l1_start_day + 10, 40):
+        return False, {"reason": "資料天數不足以切片檢驗 W 底型態"}
+
+    n_len = len(df)
+
+    # 1. 左腳 (L1)：過去第 16 天至第 30 天 (iloc[-l1_start_day : -(l1_end_day - 1)])
+    # 注意: 若 l1_end_day=16, 則切片為 iloc[-30 : -15], 包含第 30 天前到第 16 天前
+    sub_l1 = df.iloc[-l1_start_day : -(l1_end_day - 1)]
+    if sub_l1.empty:
+        return False, {"reason": "L1 觀察區間為空"}
+
+    l1_idx = sub_l1["Low"].idxmin()
+    l1_price = float(sub_l1.loc[l1_idx, "Low"])
+    l1_vol = float(sub_l1.loc[l1_idx, "Volume"])
+    l1_pos = df.index.get_loc(l1_idx)
+    l1_date = sub_l1.loc[l1_idx].name
+
+    # 3. 右腳 (L2)：過去第 2 天至第 10 天 (iloc[-l2_start_day : -(l2_end_day - 1)])
+    # 若 l2_end_day=2, 則切片為 iloc[-10 : -1], 包含第 10 天前至第 2 天前
+    sub_l2 = df.iloc[-l2_start_day : -(l2_end_day - 1)]
+    if sub_l2.empty:
+        return False, {"reason": "L2 觀察區間為空"}
+
+    l2_idx = sub_l2["Low"].idxmin()
+    l2_price = float(sub_l2.loc[l2_idx, "Low"])
+    l2_vol = float(sub_l2.loc[l2_idx, "Volume"])
+    l2_pos = df.index.get_loc(l2_idx)
+    l2_date = sub_l2.loc[l2_idx].name
+
+    # 兩腳時間間隔過濾：必須相隔至少 min_interval_days 天 (預設 7 天)
+    interval_days = l2_pos - l1_pos
+    if interval_days < min_interval_days:
+        return False, {"reason": f"兩腳間隔 {interval_days} 天未達 {min_interval_days} 天"}
+
+    # 左低右高 / 雙底支撐確認：L2 與 L1 差距在 min_l2_ratio (-1.5%) 至 max_l2_ratio (+3.5%)
+    l2_diff_ratio = (l2_price - l1_price) / l1_price if l1_price > 0 else 999.0
+    if not (min_l2_ratio <= l2_diff_ratio <= max_l2_ratio):
+        return False, {"reason": f"兩腳價差幅度 {l2_diff_ratio*100:.2f}% 不在容許範圍內"}
+
+    # 2. 中間頸線峰位 (Neckline Peak)：在 L1_Date 之後、至過去第 5 天之間的最高價
+    # 切片範圍: 從 l1_pos + 1 至 n_len - 4
+    neck_start = l1_pos + 1
+    neck_end = n_len - 4
+    if neck_start >= neck_end:
+        return False, {"reason": "頸線峰位觀察區間不足"}
+
+    sub_neckline = df.iloc[neck_start:neck_end]
+    neck_idx = sub_neckline["High"].idxmax()
+    neckline_price = float(sub_neckline.loc[neck_idx, "High"])
+    neck_pos = df.index.get_loc(neck_idx)
+    neckline_date = sub_neckline.loc[neck_idx].name
+
+    # 確保右腳在頸線之後
+    if l2_pos <= neck_pos:
+        return False, {"reason": "右腳必須位於中間頸線峰位之後"}
+
+    # 空間幅度過濾：Neckline_Price 必須比 L1_Price 高出至少 6%
+    neckline_gain_pct = ((neckline_price - l1_price) / l1_price) * 100.0 if l1_price > 0 else 0.0
+    if neckline_gain_pct < min_neckline_gain_pct:
+        return False, {"reason": f"頸線反彈幅度 {neckline_gain_pct:.1f}% 未達 {min_neckline_gain_pct}% 門檻"}
+
+    # 4. 量能結構過濾：右腳最低點成交量 < 左腳成交量，或 < 20 日均量
+    l2_row = df.loc[l2_idx]
+    l2_vol_ma20 = float(l2_row.get("Vol_MA20", 0.0))
+    vol_ok = (l2_vol < l1_vol) or (l2_vol_ma20 > 0 and l2_vol < l2_vol_ma20)
+    if not vol_ok:
+        return False, {"reason": f"右腳成交量 ({l2_vol:.1f}) 未量縮於左腳 ({l1_vol:.1f}) 或 20MA均量"}
+
+    # W 底等幅測距目標價
+    min_bottom = min(l1_price, l2_price)
+    target_price = round(neckline_price + (neckline_price - min_bottom), 2)
+
+    # 5. 今日狀況與觸發訊號檢驗
+    today = df.iloc[-1]
+    today_close = float(today["Close"])
+    today_open = float(today["Open"])
+    today_vol = float(today["Volume"])
+    today_ma5 = float(today.get("MA5", 0.0))
+    today_vol_ma5 = float(today.get("Vol_MA5", 0.0))
+    is_red = today_close > today_open
+
+    triggered_sub_modes = []
+
+    # 模式 D-1（右腳潛伏轉折買點）：站上 5MA、收紅 K、距離 L2 幅度在 4% 內、尚未大幅突破頸線
+    dist_l2_pct = ((today_close - l2_price) / l2_price) * 100.0 if l2_price > 0 else 999.0
+    is_d1_triggered = (
+        (today_close >= l2_price) and
+        (today_close > today_ma5) and
+        is_red and
+        (0.0 <= dist_l2_pct <= d1_max_distance_pct) and
+        (today_close <= neckline_price)
+    )
+    if enable_d1 and is_d1_triggered:
+        triggered_sub_modes.append("模式D-1: 右腳轉折")
+
+    # 模式 D-2（標準帶量突破頸線買點）：收盤正式突破 Neckline、收紅 K、成交量 >= 5 日均量 1.8 倍
+    vol_ratio = (today_vol / today_vol_ma5) if today_vol_ma5 > 0 else 0.0
+    is_d2_triggered = (
+        (today_close > neckline_price) and
+        is_red and
+        (vol_ratio >= d2_vol_multiplier)
+    )
+    if enable_d2 and is_d2_triggered:
+        triggered_sub_modes.append("模式D-2: 帶量突破頸線")
+
+    details = {
+        "l1_price": round(l1_price, 2),
+        "l1_date": str(l1_date.strftime("%Y-%m-%d")) if hasattr(l1_date, "strftime") else str(l1_date)[:10],
+        "l1_vol": round(l1_vol, 1),
+        "l2_price": round(l2_price, 2),
+        "l2_date": str(l2_date.strftime("%Y-%m-%d")) if hasattr(l2_date, "strftime") else str(l2_date)[:10],
+        "l2_vol": round(l2_vol, 1),
+        "neckline_price": round(neckline_price, 2),
+        "neckline_date": str(neckline_date.strftime("%Y-%m-%d")) if hasattr(neckline_date, "strftime") else str(neckline_date)[:10],
+        "target_price": target_price,
+        "neckline_gain_pct": round(neckline_gain_pct, 2),
+        "l2_diff_pct": round(l2_diff_ratio * 100.0, 2),
+        "interval_days": interval_days,
+        "vol_ok": vol_ok,
+        "sub_modes": triggered_sub_modes,
+        "today_close": round(today_close, 2),
+        "today_vol": round(today_vol, 1),
+        "vol_ratio": round(vol_ratio, 2)
+    }
+
+    if triggered_sub_modes:
+        return True, details
+
+    return False, details
+
+
 def check_market_filter(
     market_df: pd.DataFrame,
     mode: str = "any"  # "any" (季線之上 或 5MA向上), "both" (季線之上 且 5MA向上), "above_ma60", "ma5_up"
@@ -410,10 +567,12 @@ def scan_single_stock(
     enable_strat_a2: bool = True,
     enable_strat_b: bool = True,
     enable_strat_c: bool = True,
+    enable_strat_d: bool = True,
     strat_a_params: Optional[Dict] = None,
     strat_a2_params: Optional[Dict] = None,
     strat_b_params: Optional[Dict] = None,
     strat_c_params: Optional[Dict] = None,
+    strat_d_params: Optional[Dict] = None,
     market_df: Optional[pd.DataFrame] = None,
     require_market_filter: bool = False,
     market_filter_mode: str = "any"
@@ -470,6 +629,16 @@ def scan_single_stock(
         if pass_c:
             signals.append("策略C: 量縮回測轉強")
             strat_details["C"] = info_c
+
+    # 策略 D: 標準 W 底（雙重底）
+    if enable_strat_d:
+        pd_ = strat_d_params or {}
+        pass_d, info_d = strategy_d_double_bottom(df, **pd_)
+        if pass_d:
+            sub_modes = info_d.get("sub_modes", ["W底型態"])
+            for sm in sub_modes:
+                signals.append(f"策略D: {sm}")
+            strat_details["D"] = info_d
 
     if signals:
         return {

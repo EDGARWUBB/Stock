@@ -375,6 +375,22 @@ def main():
             strat_c_params["surge_vol_mult"] = st.slider("攻擊紅K量能倍數 (大於5日均量N倍)", 1.5, 3.0, 2.0, step=0.1)
             strat_c_params["ma_bias_pct"] = st.slider("回測均線乖離率容許範圍 (±%)", 1.0, 4.0, 2.0, step=0.5)
 
+    # 策略 D
+    enable_strat_d = st.sidebar.checkbox("策略 D：標準 W 底（雙重底）型態", value=True)
+    strat_d_params = {}
+    if enable_strat_d:
+        with st.sidebar.expander("策略 D 細部參數"):
+            strat_d_params["enable_d1"] = st.checkbox("啟用 模式 D-1 (右腳潛伏轉折買點)", value=True)
+            strat_d_params["enable_d2"] = st.checkbox("啟用 模式 D-2 (帶量突破頸線買點)", value=True)
+            strat_d_params["min_neckline_gain_pct"] = st.slider("頸線反彈最小幅度 (%)", 4.0, 15.0, 6.0, step=0.5, help="頸線與左腳 L1 價格差距需 >= 此門檻")
+            strat_d_params["min_interval_days"] = st.slider("雙底最小間隔天數", 5, 15, 7, help="左腳與右腳之間需相隔至少 N 天")
+            strat_d_params["d1_max_distance_pct"] = st.slider("D-1 距離右腳上限 (%)", 1.0, 6.0, 4.0, step=0.5, help="今日收盤價距離 L2 幅度上限")
+            strat_d_params["d2_vol_multiplier"] = st.slider("D-2 突破成交量倍數", 1.2, 3.0, 1.8, step=0.1, help="突破日成交量相對於 5 日均量倍數")
+            min_l2 = st.slider("右腳比左腳最低允許 (%)", -5.0, 0.0, -1.5, step=0.5)
+            max_l2 = st.slider("右腳比左腳最高墊高 (%)", 1.0, 8.0, 3.5, step=0.5)
+            strat_d_params["min_l2_ratio"] = min_l2 / 100.0
+            strat_d_params["max_l2_ratio"] = max_l2 / 100.0
+
     # 交易日回溯模擬選擇
     st.sidebar.subheader("4. 掃描基準日")
     backtest_offset = st.sidebar.selectbox(
@@ -456,10 +472,12 @@ def main():
                     enable_strat_a2=enable_strat_a2,
                     enable_strat_b=enable_strat_b,
                     enable_strat_c=enable_strat_c,
+                    enable_strat_d=enable_strat_d,
                     strat_a_params=strat_a_params,
                     strat_a2_params=strat_a2_params,
                     strat_b_params=strat_b_params,
                     strat_c_params=strat_c_params,
+                    strat_d_params=strat_d_params,
                     market_df=sub_market,
                     require_market_filter=enable_market_filter,
                     market_filter_mode=market_filter_mode
@@ -487,8 +505,9 @@ def main():
         strat_a2_hits = sum(1 for r in results if any("策略A-2" in s for s in r["signals"]))
         strat_b_hits = sum(1 for r in results if any("策略B" in s for s in r["signals"]))
         strat_c_hits = sum(1 for r in results if any("策略C" in s for s in r["signals"]))
+        strat_d_hits = sum(1 for r in results if any("策略D" in s for s in r["signals"]))
 
-        m1, m2, m3, m4, m5, m6 = st.columns(6)
+        m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
         with m1:
             st.metric("掃描總檔數", f"{scanned_count} 檔")
         with m2:
@@ -501,6 +520,8 @@ def main():
             st.metric("🚀 盤整突破 (B)", f"{strat_b_hits} 檔")
         with m6:
             st.metric("🎯 回測轉強 (C)", f"{strat_c_hits} 檔")
+        with m7:
+            st.metric("👑 W底雙重底 (D)", f"{strat_d_hits} 檔")
 
         st.markdown("---")
         st.subheader(f"📋 策略觸發精選名單 (共 {len(results)} 檔)")
@@ -570,12 +591,15 @@ def main():
                 else:
                     display_df = full_df
 
+                w_bottom_info = matched_result.get("details", {}).get("D") if (matched_result and matched_result.get("details")) else None
+
                 fig = plot_stock_kline(
                     df=display_df,
                     symbol=selected_symbol,
                     name=stock_name,
                     signals=signals,
-                    days=60
+                    days=60,
+                    w_bottom_info=w_bottom_info
                 )
                 st.plotly_chart(fig, use_container_width=True)
 
@@ -637,6 +661,22 @@ def main():
                             - **均線生命線：** 60MA 季線斜率向上：{'✅ 季線多頭保護' if info['ma60_up'] else '❌'}
                             - **回測支撐與量縮：** 拉回接近 10MA/20MA 乖離內：{'✅ 支撐測試' if info['near_ma_flag'] else '❌'}，回測量能萎縮：{'✅ 籌碼安定' if info['vol_shrunk'] else '❌'}
                             - **轉強訊號確認：** 今日收紅 K ({'✅' if info['is_red'] else '❌'})、成交量較昨日放大 ({'✅' if info['vol_increased'] else '❌'})、突破昨日高點 `{info['yest_high']} 元` ({'✅' if info['break_yest_high'] else '❌'})
+                            """)
+
+                    if "D" in details:
+                        with st.expander("📌 策略 D：標準 W 底（雙重底） 檢驗細節", expanded=True):
+                            info = details["D"]
+                            sub_mode_str = "、".join(info.get('sub_modes', ['W底型態']))
+                            tgt_gain = round(((info['target_price'] - info['today_close']) / info['today_close'] * 100.0), 2) if info.get('today_close') else 0.0
+                            st.markdown(f"""
+                            - **觸發子模式：** **{sub_mode_str}**
+                            - **左腳最低點 (L1)：** `{info['l1_price']} 元` (日期: `{info['l1_date']}`)，當日量 `{info['l1_vol']:,.0f} 張`
+                            - **右腳最低點 (L2)：** `{info['l2_price']} 元` (日期: `{info['l2_date']}`)，當日量 `{info['l2_vol']:,.0f} 張`
+                            - **中間頸線峰位 (Neckline)：** `{info['neckline_price']} 元` (日期: `{info['neckline_date']}`)
+                            - **空間幅度過濾：** 頸線比左腳高出 **`{info['neckline_gain_pct']:.2f}%`** (大於 6% 門檻：✅ 空間充分，非死魚盤整)
+                            - **雙底對稱與間隔：** 兩腳相隔 **`{info['interval_days']} 個交易日`** (>=門檻)，L2/L1 價差 **`{info['l2_diff_pct']:+.2f}%`** (✅ 雙底支撐確立)
+                            - **量能結構過濾：** 右腳量縮於左腳或小於 20MA 均量：{'✅ 賣壓枯竭' if info['vol_ok'] else '❌'} (今日量/5MA比：`{info['vol_ratio']} 倍`)
+                            - **🎯 等幅測距目標價：** **`{info['target_price']} 元`** (預估潛在漲幅：**`{tgt_gain:+.2f}%`**)
                             """)
 
     # ============================
@@ -752,6 +792,51 @@ def main():
         condition3 = close > open and volume > volume[1] and close > high[1];
 
         if condition1 and condition2 and hadSurge and nearMA and condition3 then ret = 1;
+        ```
+
+        #### 3. XQ 全球贏家 XS 選股腳本實作範例 (策略 D：標準 W 底帶量突破)
+        ```pascal
+        // ==========================================
+        // 策略 D: 標準 W 底 (Double Bottom) 帶量突破頸線 (XQ XS 選股腳本)
+        // ==========================================
+        input: minVol(1000, "5日均量門檻(張)");
+        input: minPrice(15, "收盤價下限(元)");
+        input: neckPct(6.0, "頸線反彈最小幅度(%)");
+        input: volMult(1.8, "D-2突破爆量倍數");
+
+        settotalbar(60);
+
+        // 1. 基礎流動性過濾
+        condition1 = Average(volume, 5) >= minVol and close >= minPrice;
+
+        // 2. 左腳 L1: 過去第 16 天至第 30 天之最低價
+        variable: L1_Price(0), L1_Bar(0), L2_Price(0), L2_Bar(0), Neck_Price(0), i(0);
+        L1_Price = Lowest(low[16], 15);
+        for i = 16 to 30 begin
+            if low[i] = L1_Price then L1_Bar = i;
+        end;
+
+        // 3. 右腳 L2: 過去第 2 天至第 10 天之最低價
+        L2_Price = Lowest(low[2], 9);
+        for i = 2 to 10 begin
+            if low[i] = L2_Price then L2_Bar = i;
+        end;
+
+        // 4. 頸線峰位: L1 之後至前 5 天最高價
+        Neck_Price = Highest(high[5], maxlist(L1_Bar - 5, 1));
+
+        // 5. 兩腳間隔 >= 7 天，且 L2/L1 價差在 -1.5% 至 +3.5% 之間 (左低右高支撐確立)
+        condition2 = (L1_Bar - L2_Bar >= 7) 
+                     and (L2_Price >= L1_Price * 0.985) 
+                     and (L2_Price <= L1_Price * 1.035);
+
+        // 6. 空間幅度過濾：頸線高出左腳至少 6%
+        condition3 = (Neck_Price - L1_Price) / L1_Price * 100 >= neckPct;
+
+        // 7. 模式 D-2 帶量突破頸線買點 (今日收紅、創高突頸線、出量1.8倍)
+        condition4 = (close > Neck_Price) and (close > open) and (volume >= Average(volume, 5) * volMult);
+
+        if condition1 and condition2 and condition3 and condition4 then ret = 1;
         ```
         """)
 

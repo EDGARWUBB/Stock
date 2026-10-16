@@ -8,7 +8,8 @@ def plot_stock_kline(
     symbol: str, 
     name: str = "", 
     signals: Optional[List[str]] = None,
-    days: int = 60
+    days: int = 60,
+    w_bottom_info: Optional[Dict[str, Any]] = None
 ) -> go.Figure:
     """
     使用 Plotly 繪製台股 K 線圖與成交量圖 (近 60 日)
@@ -20,7 +21,8 @@ def plot_stock_kline(
     - 5MA / 20MA / 60MA
     - 成交量柱狀圖 (量能紅綠配合 K 線)
     - 5MA 成交量均線
-    - 觸發訊號標記 (若有)
+    - 觸發訊號標記
+    - W 底型態標註: 頸線 (Neckline)、雙底圓點 (L1/L2)、等幅測距目標價
     """
     if df is None or df.empty:
         fig = go.Figure()
@@ -111,6 +113,96 @@ def plot_stock_kline(
             ),
             row=1, col=1
         )
+
+    # 2.5 策略 D: W 底（雙重底）特徵繪製
+    if w_bottom_info:
+        neck_p = w_bottom_info.get("neckline_price")
+        l1_p = w_bottom_info.get("l1_price")
+        l1_d = str(w_bottom_info.get("l1_date", ""))
+        l2_p = w_bottom_info.get("l2_price")
+        l2_d = str(w_bottom_info.get("l2_date", ""))
+        tgt_p = w_bottom_info.get("target_price")
+
+        # 繪製頸線 (Neckline) 橘色虛線
+        if neck_p and len(date_strs) > 0:
+            fig.add_shape(
+                type="line",
+                x0=date_strs[0],
+                x1=date_strs[-1],
+                y0=neck_p,
+                y1=neck_p,
+                line=dict(color="#E67E22", width=2, dash="dash"),
+                row=1, col=1
+            )
+            fig.add_annotation(
+                x=date_strs[-1],
+                y=neck_p,
+                text=f"<b>頸線 (Neckline): {neck_p:.2f}元</b>",
+                showarrow=False,
+                xanchor="right",
+                yanchor="bottom",
+                font=dict(color="#D35400", size=11),
+                bgcolor="rgba(254, 249, 231, 0.9)",
+                bordercolor="#E67E22",
+                borderwidth=1,
+                row=1, col=1
+            )
+
+        # 繪製 L1（左腳）與 L2（右腳）圓點標註
+        scatter_x = []
+        scatter_y = []
+        scatter_text = []
+        if l1_d in date_strs and l1_p:
+            scatter_x.append(l1_d)
+            scatter_y.append(l1_p)
+            scatter_text.append(f"<b>L1 左腳</b><br>{l1_p:.2f}元")
+        if l2_d in date_strs and l2_p:
+            scatter_x.append(l2_d)
+            scatter_y.append(l2_p)
+            scatter_text.append(f"<b>L2 右腳</b><br>{l2_p:.2f}元")
+
+        if scatter_x:
+            fig.add_trace(
+                go.Scatter(
+                    x=scatter_x,
+                    y=scatter_y,
+                    mode="markers+text",
+                    name="W底雙腳 (L1 / L2)",
+                    marker=dict(symbol="circle", size=13, color="#8E44AD", line=dict(color="white", width=2)),
+                    text=scatter_text,
+                    textposition=["bottom center"] * len(scatter_x),
+                    textfont=dict(color="#8E44AD", size=11),
+                    hoverinfo="text"
+                ),
+                row=1, col=1
+            )
+
+        # 繪製 W 底等幅測距目標價 綠色點線
+        if tgt_p and len(date_strs) > 0:
+            fig.add_shape(
+                type="line",
+                x0=date_strs[0],
+                x1=date_strs[-1],
+                y0=tgt_p,
+                y1=tgt_p,
+                line=dict(color="#27AE60", width=2, dash="dot"),
+                row=1, col=1
+            )
+            latest_c = float(plot_df["Close"].iloc[-1])
+            tgt_gain = ((tgt_p - latest_c) / latest_c) * 100.0 if latest_c > 0 else 0.0
+            fig.add_annotation(
+                x=date_strs[-1],
+                y=tgt_p,
+                text=f"<b>🎯 W底等幅測距目標: {tgt_p:.2f}元 (+{tgt_gain:.1f}%)</b>",
+                showarrow=False,
+                xanchor="right",
+                yanchor="bottom",
+                font=dict(color="#196F3D", size=11),
+                bgcolor="rgba(234, 250, 234, 0.9)",
+                bordercolor="#27AE60",
+                borderwidth=1,
+                row=1, col=1
+            )
 
     # 3. 標記觸發訊號位置 (在最新一個交易日高點上方標註箭頭)
     if signals and len(plot_df) > 0:
