@@ -107,3 +107,29 @@ def fetch_multiple_stocks(symbols: List[str], period: str = "6mo", progress_call
         if progress_callback:
             progress_callback(idx + 1, total, sym)
     return data_dict
+
+def fetch_market_index(ticker: str = "^TWII", period: str = "6mo") -> Optional[pd.DataFrame]:
+    """
+    抓取台股加權指數 (^TWII) 並計算 5MA, 20MA, 60MA 作為大盤環境濾網
+    """
+    try:
+        t = yf.Ticker(ticker)
+        df = t.history(period=period, auto_adjust=False)
+        if df is None or df.empty or len(df) < 20:
+            return None
+
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+
+        df.sort_index(ascending=True, inplace=True)
+        df["MA5"] = df["Close"].rolling(window=5).mean()
+        df["MA10"] = df["Close"].rolling(window=10).mean()
+        df["MA20"] = df["Close"].rolling(window=20).mean()
+        df["MA60"] = df["Close"].rolling(window=60).mean()
+        df["Change_Pct"] = df["Close"].pct_change() * 100
+        df["Is_Red"] = df["Close"] > df["Open"]
+
+        return df
+    except Exception as e:
+        print(f"Error fetching market index {ticker}: {e}")
+        return None

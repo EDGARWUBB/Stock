@@ -45,7 +45,8 @@ def strategy_a_breakdown_reversal(
     df: pd.DataFrame,
     lookback_window: int = 25,
     exclude_recent: int = 3,
-    vol_multiplier: float = 1.5
+    vol_multiplier: float = 1.5,
+    max_stop_loss_pct: float = 7.0
 ) -> Tuple[bool, Dict[str, Any]]:
     """
     策略 A：帶量破底翻（假跌破真反轉）
@@ -53,13 +54,13 @@ def strategy_a_breakdown_reversal(
     - 破底動作：最近 3 個交易日內，曾出現最低價小於 Prev_Low。
     - 翻揚確認：今日收盤價重新站回 Prev_Low 之上，且今日為紅 K（收盤價 大於 開盤價）。
     - 量能確認：今日成交量 大於 5 日均量的 1.5 倍（確保有買盤實質承接，排除無量反彈）。
+    - 停損空間過濾（控制風險報酬比）：今日收盤價距離近 3 日破底最低價的幅度需小於 7%
+      公式：(Close - Min_Low_3D) / Close < 0.07，避免當日過度拉抬導致追價風險過高。
     """
     if df is None or len(df) < lookback_window + 5:
         return False, {"reason": f"資料天數不足 {lookback_window + 5} 天"}
 
     # 取過去區間（排除最近 exclude_recent 天）
-    # 最近 exclude_recent 天對應 iloc[-exclude_recent:]
-    # 前期區間對應 iloc[-(lookback_window) : -(exclude_recent)]
     prev_window = df.iloc[-(lookback_window) : -(exclude_recent)]
     if prev_window.empty:
         return False, {"reason": "前期計算區間為空"}
@@ -88,6 +89,10 @@ def strategy_a_breakdown_reversal(
     vol_ratio = (today_vol / today_vol_ma5) if today_vol_ma5 > 0 else 0.0
     vol_confirmed = vol_ratio >= vol_multiplier
 
+    # 停損空間過濾：(Close - Min_Low_3D) / Close < 0.07
+    stop_loss_pct = ((today_close - recent_min_low) / today_close * 100.0) if today_close > 0 else 0.0
+    pass_stop_loss = ((today_close - recent_min_low) / today_close) < (max_stop_loss_pct / 100.0)
+
     details = {
         "prev_low": round(prev_low, 2),
         "recent_min_low": round(recent_min_low, 2),
@@ -96,13 +101,84 @@ def strategy_a_breakdown_reversal(
         "today_vol": round(today_vol, 1),
         "today_vol_ma5": round(today_vol_ma5, 1),
         "vol_ratio": round(vol_ratio, 2),
+        "stop_loss_pct": round(stop_loss_pct, 2),
         "had_breakdown": had_breakdown,
         "reclaimed": reclaimed,
         "is_red": is_red,
-        "vol_confirmed": vol_confirmed
+        "vol_confirmed": vol_confirmed,
+        "pass_stop_loss": pass_stop_loss
     }
 
-    if had_breakdown and reclaimed and is_red and vol_confirmed:
+    if had_breakdown and reclaimed and is_red and vol_confirmed and pass_stop_loss:
+        return True, details
+    return False, details
+
+
+def strategy_a2_reversal_pullback(
+    df: pd.DataFrame,
+    lookback_trigger_days: int = 5,
+    max_distance_pct: float = 3.0,
+    lookback_window: int = 25,
+    exclude_recent: int = 3,
+    vol_multiplier: float = 1.5
+) -> Tuple[bool, Dict[str, Any]]:
+    """
+    子模式「策略 A-2：破底翻後量縮回測買點」：
+    - 過去 3 至 5 日內曾觸發「帶量破底翻」
+    - 且今日股價拉回靠近 Prev_Low（距離在 0% 至 3% 之間，公式：0 <= (Close - Prev_Low) / Prev_Low <= 0.03）
+    - 今日成交量小於 5 日均量（量縮籌碼安定，方便直接捕捉二次回測買點）
+    """
+    if df is None or len(df) < lookback_window + 10:
+        return False, {"reason": "資料天數不足以檢驗回測買點"}
+
+    today = df.iloc[-1]
+    today_close = float(today["Close"])
+    today_vol = float(today["Volume"])
+    today_vol_ma5 = float(today.get("Vol_MA5", 0.0))
+
+    # 1. 檢驗過去 3 至 5 日內是否曾觸發「帶量破底翻」
+    found_reversal = False
+    reversal_day_idx = None
+    prev_low = None
+
+    for i in range(1, lookback_trigger_days + 1):
+        sub_df = df.iloc[:-i]
+        triggered, info = strategy_a_breakdown_reversal(
+            sub_df, 
+            lookback_window=lookback_window,
+            exclude_recent=exclude_recent,
+            vol_multiplier=vol_multiplier,
+            max_stop_loss_pct=12.0 # 允許觸發當天空間
+        )
+        if triggered:
+            found_reversal = True
+            reversal_day_idx = i
+            prev_low = info["prev_low"]
+            break
+
+    if not found_reversal or prev_low is None:
+        return False, {"reason": f"過去 {lookback_trigger_days} 日內未曾觸發帶量破底翻"}
+
+    # 2. 今日股價拉回靠近 Prev_Low（距離在 0% 至 3% 之間）
+    distance_pct = ((today_close - prev_low) / prev_low) * 100.0 if prev_low > 0 else 999.0
+    near_support = (0.0 <= distance_pct <= max_distance_pct)
+
+    # 3. 今日成交量小於 5 日均量
+    vol_shrunk = today_vol < today_vol_ma5
+
+    details = {
+        "prev_low": round(prev_low, 2),
+        "today_close": round(today_close, 2),
+        "distance_pct": round(distance_pct, 2),
+        "today_vol": round(today_vol, 1),
+        "today_vol_ma5": round(today_vol_ma5, 1),
+        "reversal_ago_days": reversal_day_idx,
+        "found_reversal": found_reversal,
+        "near_support": near_support,
+        "vol_shrunk": vol_shrunk
+    }
+
+    if found_reversal and near_support and vol_shrunk:
         return True, details
     return False, details
 
@@ -269,6 +345,60 @@ def strategy_c_pullback_support(
     return False, details
 
 
+def check_market_filter(
+    market_df: pd.DataFrame,
+    mode: str = "any"  # "any" (季線之上 或 5MA向上), "both" (季線之上 且 5MA向上), "above_ma60", "ma5_up"
+) -> Tuple[bool, Dict[str, Any]]:
+    """
+    大盤環境濾網：
+    - 大盤指數 (如 ^TWII) 位於季線 (60MA) 之上
+    - 或大盤 5MA 斜率向上 (今日 5MA > 昨日 5MA)
+    條件滿足時才啟動做多策略，大幅降低在系統性崩跌時接刀的風險。
+    """
+    if market_df is None or len(market_df) < 65:
+        return True, {"status": "無法取得完整大盤季線資料，預設放行"}
+
+    today = market_df.iloc[-1]
+    yest = market_df.iloc[-2]
+
+    close = float(today["Close"])
+    ma5_today = float(today.get("MA5", 0.0))
+    ma5_yest = float(yest.get("MA5", 0.0))
+    ma20_today = float(today.get("MA20", 0.0))
+    ma60_today = float(today.get("MA60", 0.0))
+    change_pct = float(today.get("Change_Pct", 0.0))
+
+    above_ma60 = close >= ma60_today
+    ma5_up = ma5_today >= ma5_yest
+
+    details = {
+        "index_close": round(close, 2),
+        "index_change_pct": round(change_pct, 2),
+        "ma5": round(ma5_today, 2),
+        "ma20": round(ma20_today, 2),
+        "ma60": round(ma60_today, 2),
+        "above_ma60": above_ma60,
+        "ma5_up": ma5_up,
+        "bias_ma60_pct": round((close - ma60_today) / ma60_today * 100.0, 2) if ma60_today > 0 else 0.0
+    }
+
+    if mode == "both":
+        is_safe = above_ma60 and ma5_up
+        details["condition_text"] = "季線之上 且 5MA 向上"
+    elif mode == "above_ma60":
+        is_safe = above_ma60
+        details["condition_text"] = "季線之上"
+    elif mode == "ma5_up":
+        is_safe = ma5_up
+        details["condition_text"] = "5MA 向上"
+    else:  # "any"
+        is_safe = above_ma60 or ma5_up
+        details["condition_text"] = "季線之上 或 5MA 向上"
+
+    details["is_safe"] = is_safe
+    return is_safe, details
+
+
 def scan_single_stock(
     symbol: str, 
     df: pd.DataFrame, 
@@ -277,17 +407,28 @@ def scan_single_stock(
     min_vol_ma5: float = 1000.0,
     min_price: float = 15.0,
     enable_strat_a: bool = True,
+    enable_strat_a2: bool = True,
     enable_strat_b: bool = True,
     enable_strat_c: bool = True,
     strat_a_params: Optional[Dict] = None,
+    strat_a2_params: Optional[Dict] = None,
     strat_b_params: Optional[Dict] = None,
-    strat_c_params: Optional[Dict] = None
+    strat_c_params: Optional[Dict] = None,
+    market_df: Optional[pd.DataFrame] = None,
+    require_market_filter: bool = False,
+    market_filter_mode: str = "any"
 ) -> Optional[Dict[str, Any]]:
     """
     對單檔股票執行基礎流動性過濾與各項策略檢驗
     """
     if df is None or len(df) < 60:
         return None
+
+    # 0. 大盤環境濾網（選用）
+    if require_market_filter and market_df is not None:
+        is_market_safe, _ = check_market_filter(market_df, mode=market_filter_mode)
+        if not is_market_safe:
+            return None
 
     # 1. 基礎流動性過濾（必要條件）
     liq_pass, liq_info = filter_liquidity(df, min_vol_ma5=min_vol_ma5, min_price=min_price)
@@ -298,7 +439,7 @@ def scan_single_stock(
     signals = []
     strat_details = {}
 
-    # 策略 A
+    # 策略 A: 帶量破底翻
     if enable_strat_a:
         p = strat_a_params or {}
         pass_a, info_a = strategy_a_breakdown_reversal(df, **p)
@@ -306,7 +447,15 @@ def scan_single_stock(
             signals.append("策略A: 帶量破底翻")
             strat_details["A"] = info_a
 
-    # 策略 B
+    # 策略 A-2: 破底翻後量縮回測買點
+    if enable_strat_a2:
+        p2 = strat_a2_params or {}
+        pass_a2, info_a2 = strategy_a2_reversal_pullback(df, **p2)
+        if pass_a2:
+            signals.append("策略A-2: 破底翻量縮回測")
+            strat_details["A2"] = info_a2
+
+    # 策略 B: 盤整帶量突破
     if enable_strat_b:
         p = strat_b_params or {}
         pass_b, info_b = strategy_b_consolidation_breakout(df, **p)
@@ -314,7 +463,7 @@ def scan_single_stock(
             signals.append("策略B: 盤整帶量突破")
             strat_details["B"] = info_b
 
-    # 策略 C
+    # 策略 C: 強勢股量縮回測支撐
     if enable_strat_c:
         p = strat_c_params or {}
         pass_c, info_c = strategy_c_pullback_support(df, **p)
