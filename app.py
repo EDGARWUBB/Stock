@@ -66,6 +66,31 @@ except ImportError:
         return False, {"reason": "模組更新中"}
 
 from chart_plotter import plot_stock_kline
+import importlib
+import inspect
+
+try:
+    import data_loader
+    import strategies
+    import chart_plotter
+    importlib.reload(data_loader)
+    importlib.reload(strategies)
+    importlib.reload(chart_plotter)
+except Exception:
+    pass
+
+def safe_scan_single_stock(**kwargs):
+    """防禦性呼叫，避免模組在快取或版本不一致時因參數不符而拋出 TypeError"""
+    try:
+        sig = inspect.signature(scan_single_stock)
+        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        if has_var_kw:
+            valid_kwargs = kwargs
+        else:
+            valid_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
+        return scan_single_stock(**valid_kwargs)
+    except Exception:
+        return scan_single_stock(**kwargs)
 
 # 設定頁面佈局與標題
 st.set_page_config(
@@ -461,7 +486,7 @@ def main():
                     liquidity_pass_count += 1
 
                 # 策略檢查
-                res = scan_single_stock(
+                res = safe_scan_single_stock(
                     symbol=symbol,
                     df=df_target,
                     name=names_dict.get(symbol, symbol),

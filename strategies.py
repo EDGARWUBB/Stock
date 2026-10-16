@@ -575,7 +575,8 @@ def scan_single_stock(
     strat_d_params: Optional[Dict] = None,
     market_df: Optional[pd.DataFrame] = None,
     require_market_filter: bool = False,
-    market_filter_mode: str = "any"
+    market_filter_mode: str = "any",
+    **kwargs
 ) -> Optional[Dict[str, Any]]:
     """
     對單檔股票執行基礎流動性過濾與各項策略檢驗
