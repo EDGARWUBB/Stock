@@ -9,6 +9,12 @@ import yfinance as yf
 from data_loader import load_stock_metadata, fetch_stock_data, calculate_technical_indicators
 
 try:
+    from data_loader import resample_to_weekly
+except ImportError:
+    def resample_to_weekly(df):
+        return df
+
+try:
     from data_loader import fetch_market_index
 except ImportError:
     def fetch_market_index(ticker: str = "^TWII", period: str = "6mo"):
@@ -607,14 +613,62 @@ def main():
             matched_result = next((r for r in results if r["symbol"] == selected_symbol), None)
             signals = matched_result["signals"] if matched_result else []
 
-            full_df = get_cached_stock_data(selected_symbol, period="6mo")
+            # K 線圖控制列 (支援手勢縮放、日K / 週K 切換、預設視角切換)
+            chart_ctrl1, chart_ctrl2, chart_ctrl3 = st.columns([0.3, 0.45, 0.25])
+            with chart_ctrl1:
+                kline_freq = st.radio(
+                    "📊 K 線週期",
+                    ["日 K 線", "週 K 線"],
+                    index=0,
+                    horizontal=True,
+                    help="日 K 適合短線進出；週 K 適合判定大格局趨勢與支撐壓力"
+                )
+            with chart_ctrl2:
+                range_options = ["近 60 根", "近 120 根", "近半年", "全部歷史"]
+                selected_range = st.radio(
+                    "🔍 初始顯示視野",
+                    range_options,
+                    index=0,
+                    horizontal=True,
+                    help="設定初始圖表縮放區間，圖表下方亦可直接用手指/滑鼠拖曳滑桿進行連續無段縮放！"
+                )
+            with chart_ctrl3:
+                st.caption("🖐️ **手勢操作技巧**：\n- 雙指捏合／滾輪：無段縮放\n- 手指滑動／拖曳：平移時間\n- 底部導航滑桿：雙向拉動視窗")
+
+            is_weekly = (kline_freq == "週 K 線")
+            fetch_period = "2y" if is_weekly else "1y"
+
+            full_df = get_cached_stock_data(selected_symbol, period=fetch_period)
 
             if full_df is not None and not full_df.empty:
-                if backtest_offset > 0 and len(full_df) > backtest_offset + 60:
-                    display_df = full_df.iloc[:-backtest_offset].copy()
-                    display_df = calculate_technical_indicators(display_df)
+                # 處理基準日偏移 (回溯模擬)
+                if backtest_offset > 0 and len(full_df) > backtest_offset + 30:
+                    raw_df = full_df.iloc[:-backtest_offset].copy()
                 else:
-                    display_df = full_df
+                    raw_df = full_df.copy()
+
+                if is_weekly:
+                    display_df = resample_to_weekly(raw_df)
+                    timeframe_val = "weekly"
+                    if selected_range == "近 60 根":
+                        display_days = 60
+                    elif selected_range == "近 120 根":
+                        display_days = 120
+                    elif selected_range == "近半年":
+                        display_days = 26
+                    else:
+                        display_days = len(display_df)
+                else:
+                    display_df = calculate_technical_indicators(raw_df)
+                    timeframe_val = "daily"
+                    if selected_range == "近 60 根":
+                        display_days = 60
+                    elif selected_range == "近 120 根":
+                        display_days = 120
+                    elif selected_range == "近半年":
+                        display_days = 130
+                    else:
+                        display_days = len(display_df)
 
                 w_bottom_info = matched_result.get("details", {}).get("D") if (matched_result and matched_result.get("details")) else None
 
@@ -623,23 +677,42 @@ def main():
                     symbol=selected_symbol,
                     name=stock_name,
                     signals=signals,
-                    days=60,
-                    w_bottom_info=w_bottom_info
+                    days=display_days,
+                    w_bottom_info=w_bottom_info,
+                    timeframe=timeframe_val
                 )
-                st.plotly_chart(fig, use_container_width=True)
+
+                st.plotly_chart(
+                    fig,
+                    use_container_width=True,
+                    config={
+                        "scrollZoom": True,
+                        "displayModeBar": True,
+                        "modeBarButtonsToAdd": ["drawline", "drawopenpath", "eraseshape"],
+                        "displaylogo": False,
+                        "toImageButtonOptions": {"format": "png", "filename": f"{selected_symbol}_{timeframe_val}_kline"}
+                    }
+                )
 
                 latest_k = display_df.iloc[-1]
                 c1, c2, c3, c4, c5 = st.columns(5)
+                price_label = "本週收盤價" if is_weekly else "最新收盤價"
+                change_label = "本週漲跌幅" if is_weekly else "最新漲跌幅"
+                vol_label = "本週成交量" if is_weekly else "當日成交量"
+                ma5_lbl = "5W MA (5週線)" if is_weekly else "5MA 週線"
+                ma20_lbl = "20W MA (20週線)" if is_weekly else "20MA 月線"
+                ma60_lbl = "60W MA (60週線)" if is_weekly else "60MA 季線"
+
                 with c1:
-                    st.metric("最新收盤價", f"{latest_k['Close']:.2f} 元", f"{latest_k['Change_Pct']:+.2f}%")
+                    st.metric(price_label, f"{latest_k['Close']:.2f} 元", f"{latest_k['Change_Pct']:+.2f}%")
                 with c2:
-                    st.metric("當日成交量", f"{latest_k['Volume']:,.0f} 張")
+                    st.metric(vol_label, f"{latest_k['Volume']:,.0f} 張")
                 with c3:
-                    st.metric("5MA 週線", f"{latest_k['MA5']:.2f} 元")
+                    st.metric(ma5_lbl, f"{latest_k.get('MA5', 0.0):.2f} 元")
                 with c4:
-                    st.metric("20MA 月線", f"{latest_k['MA20']:.2f} 元")
+                    st.metric(ma20_lbl, f"{latest_k.get('MA20', 0.0):.2f} 元")
                 with c5:
-                    st.metric("60MA 季線", f"{latest_k['MA60']:.2f} 元")
+                    st.metric(ma60_lbl, f"{latest_k.get('MA60', 0.0):.2f} 元")
 
                 if matched_result and matched_result.get("details"):
                     st.markdown("#### 🎯 策略觸發指標條件詳情")

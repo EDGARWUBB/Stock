@@ -52,12 +52,53 @@ def calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     # 成交量均線 (以張為單位)
     df["Vol_MA5"] = df["Volume"].rolling(window=5).mean()
+    df["Vol_MA20"] = df["Volume"].rolling(window=20).mean()
 
     # 每日漲跌幅 (%) 與 K線實體漲跌
     df["Change_Pct"] = df["Close"].pct_change() * 100
     df["Is_Red"] = df["Close"] > df["Open"]
 
     return df
+
+def resample_to_weekly(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    將日 K 線資料重採樣轉換為週 K 線 (以每週五或週最後交易日為基準)
+    並自動計算 5W / 10W / 20W / 60W 週均線與 5 週均量
+    """
+    if df is None or len(df) < 5:
+        return df
+
+    df_copy = df.copy()
+    if not isinstance(df_copy.index, pd.DatetimeIndex):
+        df_copy.index = pd.to_datetime(df_copy.index)
+    df_copy.sort_index(ascending=True, inplace=True)
+
+    weekly_df = df_copy.resample("W-FRI").agg({
+        "Open": "first",
+        "High": "max",
+        "Low": "min",
+        "Close": "last",
+        "Volume": "sum"
+    }).dropna(subset=["Close"])
+
+    if weekly_df.empty:
+        return weekly_df
+
+    # 計算週均線
+    weekly_df["MA5"] = weekly_df["Close"].rolling(window=5).mean()
+    weekly_df["MA10"] = weekly_df["Close"].rolling(window=10).mean()
+    weekly_df["MA20"] = weekly_df["Close"].rolling(window=20).mean()
+    weekly_df["MA60"] = weekly_df["Close"].rolling(window=60).mean()
+
+    # 週成交量均線 (張)
+    weekly_df["Vol_MA5"] = weekly_df["Volume"].rolling(window=5).mean()
+    weekly_df["Vol_MA20"] = weekly_df["Volume"].rolling(window=20).mean()
+
+    # 週漲跌幅與紅黑K
+    weekly_df["Change_Pct"] = weekly_df["Close"].pct_change() * 100
+    weekly_df["Is_Red"] = weekly_df["Close"] >= weekly_df["Open"]
+
+    return weekly_df
 
 def fetch_stock_data(symbol: str, period: str = "6mo") -> Optional[pd.DataFrame]:
     """
