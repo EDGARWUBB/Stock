@@ -37,8 +37,137 @@ except ImportError:
         except Exception:
             return None
 
-from strategies import filter_liquidity, check_market_filter, strategy_neckline_pullback, scan_single_stock
-from chart_plotter import plot_stock_kline
+try:
+    from strategies import filter_liquidity, check_market_filter, strategy_neckline_pullback, scan_single_stock
+except ImportError:
+    # 雲端相容防護：若 GitHub 上尚未上傳更新後的 strategies.py，使用內建備用實現，避免網站崩潰
+    def filter_liquidity(df, min_vol_ma5=800.0, min_price=15.0):
+        if df is None or len(df) < 5:
+            return False, {}
+        last_row = df.iloc[-1]
+        v = last_row.get("Vol_MA5", 0.0)
+        c = last_row.get("Close", 0.0)
+        return (v >= min_vol_ma5 and c >= min_price), {"close_price": c, "vol_ma5": v}
+
+    def check_market_filter(market_df, mode="any"):
+        if market_df is None or len(market_df) < 65:
+            return True, {}
+        today = market_df.iloc[-1]
+        yest = market_df.iloc[-2]
+        c = float(today["Close"])
+        m60 = float(today.get("MA60", 0.0))
+        m5 = float(today.get("MA5", 0.0))
+        m5_y = float(yest.get("MA5", 0.0))
+        is_safe = (c >= m60 or m5 >= m5_y) if mode == "any" else (c >= m60 and m5 >= m5_y)
+        return is_safe, {"market_close": c, "ma60": m60, "is_safe": is_safe}
+
+    def strategy_neckline_pullback(
+        df,
+        lookback_window=35,
+        min_breakout_ago=2,
+        max_breakout_ago=12,
+        min_breakout_gain=1.0,
+        vol_breakout_mult=1.15,
+        pullback_tolerance_min=-3.0,
+        pullback_tolerance_max=4.5,
+        vol_shrink_pct=75.0,
+        require_red_or_up=True
+    ):
+        if df is None or len(df) < lookback_window + 15:
+            return False, {"reason": "天數不足"}
+        n = len(df)
+        today = df.iloc[-1]
+        t_c = float(today["Close"])
+        t_o = float(today["Open"])
+        y_c = float(df.iloc[-2]["Close"]) if len(df) > 1 else t_c
+
+        best = None
+        for b_ago in range(min_breakout_ago, max_breakout_ago + 1):
+            b_idx = n - b_ago - 1
+            if b_idx < lookback_window:
+                continue
+            b_row = df.iloc[b_idx]
+            b_h = float(b_row["High"])
+            b_v = float(b_row["Volume"])
+            b_vm = float(b_row.get("Vol_MA5", 0))
+
+            pre_s = max(0, b_idx - lookback_window)
+            pre_e = b_idx - 2
+            if pre_e <= pre_s:
+                continue
+            pre_df = df.iloc[pre_s : pre_e]
+            neck_p = float(pre_df["High"].max())
+            neck_d = str(pre_df["High"].idxmax())[:10]
+
+            b_gain = ((b_h - neck_p) / neck_p) * 100.0
+            v_ratio = (b_v / b_vm) if b_vm > 0 else 1.0
+
+            if b_h > neck_p and b_gain >= min_breakout_gain and v_ratio >= vol_breakout_mult:
+                after_df = df.iloc[b_idx + 1 :]
+                after_val = after_df[after_df["Volume"] > 0]
+                pb_low = float(after_df["Low"].min())
+                pb_date = str(after_df["Low"].idxmin())[:10]
+                pb_min_v = float(after_val["Volume"].min()) if not after_val.empty else float(after_df["Volume"].min())
+                dist_pct = ((pb_low - neck_p) / neck_p) * 100.0
+                is_near = (pullback_tolerance_min <= dist_pct <= pullback_tolerance_max)
+                is_shrunk = (pb_min_v <= b_v * (vol_shrink_pct / 100.0)) or (float(today["Volume"]) <= float(today.get("Vol_MA5", 999999)) * 1.1)
+                is_supp = t_c >= neck_p * 0.98
+                is_turn = (t_c >= t_o) or (t_c >= y_c) if require_red_or_up else True
+
+                if is_near and is_shrunk and is_supp and is_turn:
+                    best = {
+                        "neckline_price": round(neck_p, 2),
+                        "neckline_date": neck_d,
+                        "breakout_date": str(b_row.name)[:10],
+                        "breakout_high": round(b_h, 2),
+                        "breakout_vol": round(b_v, 0),
+                        "breakout_vol_ratio": round(v_ratio, 2),
+                        "pullback_min_low": round(pb_low, 2),
+                        "pullback_low_date": pb_date,
+                        "dist_to_neck_pct": round(dist_pct, 2),
+                        "pullback_min_vol": round(pb_min_v, 0),
+                        "vol_shrink_ratio": round((pb_min_v / b_v) * 100, 1),
+                        "today_close": round(t_c, 2),
+                        "is_supported": is_supp,
+                        "is_turning": is_turn
+                    }
+                    break
+        if best:
+            return True, best
+        return False, {"reason": "未滿足條件"}
+
+    def scan_single_stock(
+        symbol, df, name="", industry="", min_vol_ma5=800.0, min_price=15.0,
+        strat_params=None, market_df=None, require_market_filter=False, market_filter_mode="any", **kwargs
+    ):
+        if df is None or len(df) < 50:
+            return None
+        if require_market_filter and market_df is not None:
+            safe, _ = check_market_filter(market_df, mode=market_filter_mode)
+            if not safe:
+                return None
+        liq, _ = filter_liquidity(df, min_vol_ma5=min_vol_ma5, min_price=min_price)
+        if not liq:
+            return None
+        matched, details = strategy_neckline_pullback(df, **(strat_params or {}))
+        if not matched:
+            return None
+        last_row = df.iloc[-1]
+        return {
+            "symbol": symbol, "name": name, "industry": industry,
+            "close": float(last_row["Close"]), "change_pct": float(last_row.get("Change_Pct", 0.0)),
+            "volume_lots": float(last_row["Volume"]), "vol_ma5": float(last_row.get("Vol_MA5", 0.0)),
+            "signals": ["突破頸線量縮回測"], "details": details, "last_date": str(last_row.name)[:10]
+        }
+
+try:
+    from chart_plotter import plot_stock_kline
+except ImportError:
+    import plotly.graph_objects as go
+    def plot_stock_kline(df, symbol, name="", **kwargs):
+        fig = go.Figure()
+        fig.add_annotation(text=f"{symbol} {name} 走勢圖載入中...", showarrow=False)
+        return fig
 
 # 自動重載自訂模組
 try:
@@ -574,15 +703,25 @@ def main():
                 if "neckline_price" in pb_details:
                     pullback_info = pb_details
 
-            fig = plot_stock_kline(
-                df=display_df,
-                symbol=selected_symbol,
-                name=stock_name,
-                signals=signals,
-                days=display_days,
-                pullback_info=pullback_info,
-                timeframe=timeframe_val
-            )
+            try:
+                fig = plot_stock_kline(
+                    df=display_df,
+                    symbol=selected_symbol,
+                    name=stock_name,
+                    signals=signals,
+                    days=display_days,
+                    pullback_info=pullback_info,
+                    timeframe=timeframe_val
+                )
+            except TypeError:
+                fig = plot_stock_kline(
+                    df=display_df,
+                    symbol=selected_symbol,
+                    name=stock_name,
+                    signals=signals,
+                    days=display_days,
+                    w_bottom_info=pullback_info
+                )
 
             st.plotly_chart(
                 fig,
