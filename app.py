@@ -69,8 +69,11 @@ except ImportError:
         min_breakout_gain=1.0,
         vol_breakout_mult=1.15,
         pullback_tolerance_min=-3.0,
-        pullback_tolerance_max=4.5,
+        pullback_tolerance_max=3.5,
         vol_shrink_pct=75.0,
+        max_pullback_ago_days=3,
+        max_today_neck_pct=3.0,
+        today_vol_mult_max=1.8,
         require_red_or_up=True
     ):
         if df is None or len(df) < lookback_window + 15:
@@ -79,7 +82,13 @@ except ImportError:
         today = df.iloc[-1]
         t_c = float(today["Close"])
         t_o = float(today["Open"])
+        t_v = float(today["Volume"])
+        t_vm = float(today.get("Vol_MA5", 0))
         y_c = float(df.iloc[-2]["Close"]) if len(df) > 1 else t_c
+
+        # 今日若爆量超過設定倍數均量，代表當日已爆量噴出，排除追價
+        if t_vm > 0 and (t_v / t_vm) > today_vol_mult_max:
+            return False, {"reason": f"今日爆量 ({t_v/t_vm:.2f}倍 > {today_vol_mult_max:.1f}倍)，非量縮回測甜蜜點"}
 
         best = None
         for b_ago in range(min_breakout_ago, max_breakout_ago + 1):
@@ -106,12 +115,24 @@ except ImportError:
                 after_df = df.iloc[b_idx + 1 :]
                 after_val = after_df[after_df["Volume"] > 0]
                 pb_low = float(after_df["Low"].min())
-                pb_date = str(after_df["Low"].idxmin())[:10]
+                pb_idx = after_df["Low"].idxmin()
+                pb_date = str(pb_idx)[:10]
                 pb_min_v = float(after_val["Volume"].min()) if not after_val.empty else float(after_df["Volume"].min())
+
+                # 關鍵時效檢驗 1: 回測最低點必須發生在近 max_pullback_ago_days 日內
+                days_since_pb = len(after_df) - after_df.index.get_loc(pb_idx) - 1
+                if days_since_pb > max_pullback_ago_days:
+                    continue  # 回測已是太久以前的事（例如精誠已是7天前），跳過
+
+                # 關鍵時效檢驗 2: 今日收盤價距離頸線不能超過 max_today_neck_pct (例如 <= +3.0%)
+                dist_today_neck = ((t_c - neck_p) / neck_p) * 100.0
+                if dist_today_neck > max_today_neck_pct:
+                    continue  # 今日已遠離頸線噴出，排除追價
+
                 dist_pct = ((pb_low - neck_p) / neck_p) * 100.0
                 is_near = (pullback_tolerance_min <= dist_pct <= pullback_tolerance_max)
-                is_shrunk = (pb_min_v <= b_v * (vol_shrink_pct / 100.0)) or (float(today["Volume"]) <= float(today.get("Vol_MA5", 999999)) * 1.1)
-                is_supp = t_c >= neck_p * 0.98
+                is_shrunk = (pb_min_v <= b_v * (vol_shrink_pct / 100.0)) or (t_v <= t_vm * 1.2)
+                is_supp = t_c >= neck_p * 0.985
                 is_turn = (t_c >= t_o) or (t_c >= y_c) if require_red_or_up else True
 
                 if is_near and is_shrunk and is_supp and is_turn:
@@ -124,7 +145,9 @@ except ImportError:
                         "breakout_vol_ratio": round(v_ratio, 2),
                         "pullback_min_low": round(pb_low, 2),
                         "pullback_low_date": pb_date,
+                        "days_since_pullback": days_since_pb,
                         "dist_to_neck_pct": round(dist_pct, 2),
+                        "dist_today_neck_pct": round(dist_today_neck, 2),
                         "pullback_min_vol": round(pb_min_v, 0),
                         "vol_shrink_ratio": round((pb_min_v / b_v) * 100, 1),
                         "today_close": round(t_c, 2),
@@ -399,6 +422,12 @@ def main():
         tol_max = st.slider("回測允許高於頸線上限 (%)", 1.0, 8.0, 4.5, step=0.5, help="回測低點距離頸線的最高容許幅度")
         
         vol_shrink_pct = st.slider("回測量縮門檻 (突破量之 %)", 40.0, 90.0, 75.0, step=5.0, help="回測最低成交量需小於突破日的特定百分比")
+        
+        st.markdown("##### ⏱️ 及時性與防追高過濾 (排除已噴出者)")
+        max_pb_ago = st.slider("回測發生時效 (近 N 日內)", 1, 5, 3, step=1, help="回測最低點必須發生在近 N 個交易日內，排除多天前早已回測完畢已噴出的標的")
+        max_today_dist = st.slider("今日距頸線最高容許 (%)", 1.0, 6.0, 3.0, step=0.5, help="今日收盤價高於頸線的最大百分比，超過代表短線已拉開距離，避免追高")
+        today_vol_mult_max = st.slider("今日成交量上限 (5MA均量倍數)", 1.2, 3.0, 1.8, step=0.1, help="今日若爆大量(如>1.8倍)表示已噴出追價，排除該股票")
+
         require_red_or_up = st.checkbox("今日守穩收紅/轉強確認", value=True, help="要求今日收紅K或高於昨日收盤，確認回測有撐")
 
         strat_params = {
@@ -410,6 +439,9 @@ def main():
             "pullback_tolerance_min": float(tol_min),
             "pullback_tolerance_max": float(tol_max),
             "vol_shrink_pct": float(vol_shrink_pct),
+            "max_pullback_ago_days": int(max_pb_ago),
+            "max_today_neck_pct": float(max_today_dist),
+            "today_vol_mult_max": float(today_vol_mult_max),
             "require_red_or_up": require_red_or_up
         }
 

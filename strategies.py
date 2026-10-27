@@ -49,16 +49,26 @@ def strategy_neckline_pullback(
     min_breakout_gain: float = 1.0,
     vol_breakout_mult: float = 1.15,
     pullback_tolerance_min: float = -3.0,
-    pullback_tolerance_max: float = 4.5,
+    pullback_tolerance_max: float = 3.5,
     vol_shrink_pct: float = 75.0,
+    max_pullback_ago_days: int = 3,
+    max_today_neck_pct: float = 3.0,
+    today_vol_mult_max: float = 1.8,
     require_red_or_up: bool = True
 ) -> Tuple[bool, Dict[str, Any]]:
     """
-    【核心策略：突破頸線量縮回測】
+    【核心策略：突破頸線量縮回測】(及時黃金買點版)
     1. 前期頸線峰位 (Neckline)：在過去第 10 至 40 日區間尋找最高價頸線峰位 Neckline_Price。
     2. 帶量突破 (Breakout)：過去 2 至 12 日內，曾帶量（>= 1.15x 5MA量）突破頸線（High > Neckline + 1%）。
-    3. 量縮回測 (Low-Volume Retest)：突破後回測低點落在頸線附近（-3.0% 至 +4.5%），且成交量顯著萎縮（<= 突破日 75% 或 < 5MA量）。
-    4. 支撐確立與轉強 (Rebound)：今日收盤價穩守於頸線之上（>= Neckline * 0.98），今日收紅K或高於昨日收盤，確認回測有撐轉強。
+    3. 量縮回測 (Low-Volume Retest)：
+       - 突破後回測低點落在頸線附近（-3.0% 至 +3.5%）。
+       - 回測最低點必須發生在「近 3 個交易日內」（時效性確認，排除 1 週前早已回測完畢、現已噴出的標的）。
+       - 回測期間成交量顯著萎縮（<= 突破日 75% 或 < 5MA量）。
+    4. 支撐確立與即時買點 (Rebound / Entry Point)：
+       - 今日收盤價穩守於頸線之上（>= Neckline * 0.985）。
+       - 今日收盤價距離頸線幅度 <= +3.0%（確保買在頸線甜蜜點，而非已漲 5%~10% 後追高）。
+       - 今日成交量未失控爆量（<= 1.8x 5MA均量）。
+       - 今日收紅K或高於昨日收盤，確認回測有撐轉強。
     """
     if df is None or len(df) < lookback_window + 15:
         return False, {"reason": "歷史資料長度不足以檢驗型態"}
@@ -67,7 +77,13 @@ def strategy_neckline_pullback(
     today = df.iloc[-1]
     today_close = float(today["Close"])
     today_open = float(today["Open"])
+    today_vol = float(today["Volume"])
+    today_vol_ma5 = float(today.get("Vol_MA5", 0))
     yest_close = float(df.iloc[-2]["Close"]) if len(df) > 1 else today_close
+
+    # 若今日成交量過度爆量（> today_vol_mult_max 倍 5MA），代表當日已大幅爆量衝高，非量縮回測進場點
+    if today_vol_ma5 > 0 and (today_vol / today_vol_ma5) > today_vol_mult_max:
+        return False, {"reason": f"今日爆量 ({today_vol/today_vol_ma5:.2f}倍 > {today_vol_mult_max:.1f}倍)，非量縮回測甜蜜點"}
 
     best_match = None
 
@@ -103,18 +119,29 @@ def strategy_neckline_pullback(
             after_valid_vol = after_df[after_df["Volume"] > 0]
 
             pullback_min_low = float(after_df["Low"].min())
-            pullback_low_date = str(after_df["Low"].idxmin())[:10]
+            pullback_low_idx = after_df["Low"].idxmin()
+            pullback_low_date = str(pullback_low_idx)[:10]
             pullback_min_vol = float(after_valid_vol["Volume"].min()) if not after_valid_vol.empty else float(after_df["Volume"].min())
+
+            # 關鍵時效檢驗 1: 回測最低點必須發生在近 max_pullback_ago_days 日內
+            days_since_pullback = len(after_df) - after_df.index.get_loc(pullback_low_idx) - 1
+            if days_since_pullback > max_pullback_ago_days:
+                continue  # 回測已是太久以前的事（例如精誠已是7天前），跳過
+
+            # 關鍵時效檢驗 2: 今日收盤價距離頸線不能超過 max_today_neck_pct (例如 <= +3.0%)
+            dist_today_neck = ((today_close - neckline_price) / neckline_price) * 100.0
+            if dist_today_neck > max_today_neck_pct:
+                continue  # 今日已遠離頸線噴出，排除追價
 
             # 2. 回測幅度檢驗 (回測低點距離頸線的幅度)
             dist_to_neck = ((pullback_min_low - neckline_price) / neckline_price) * 100.0
             is_near_neck = (pullback_tolerance_min <= dist_to_neck <= pullback_tolerance_max)
 
             # 3. 量縮檢驗 (回測期間成交量萎縮，無沉重賣壓)
-            is_vol_shrunk = (pullback_min_vol <= b_vol * (vol_shrink_pct / 100.0)) or (float(today["Volume"]) <= float(today.get("Vol_MA5", 999999)) * 1.1)
+            is_vol_shrunk = (pullback_min_vol <= b_vol * (vol_shrink_pct / 100.0)) or (today_vol <= today_vol_ma5 * 1.2)
 
             # 4. 今日守穩頸線支撐
-            is_supported = today_close >= neckline_price * 0.98
+            is_supported = today_close >= neckline_price * 0.985
 
             # 5. 今日轉強確認
             is_turning = (today_close >= today_open) or (today_close >= yest_close) if require_red_or_up else True
@@ -129,7 +156,9 @@ def strategy_neckline_pullback(
                     "breakout_vol_ratio": round(vol_ratio, 2),
                     "pullback_min_low": round(pullback_min_low, 2),
                     "pullback_low_date": pullback_low_date,
+                    "days_since_pullback": days_since_pullback,
                     "dist_to_neck_pct": round(dist_to_neck, 2),
+                    "dist_today_neck_pct": round(dist_today_neck, 2),
                     "pullback_min_vol": round(pullback_min_vol, 0),
                     "vol_shrink_ratio": round((pullback_min_vol / b_vol) * 100, 1),
                     "today_close": round(today_close, 2),
@@ -141,7 +170,7 @@ def strategy_neckline_pullback(
 
     if best_match:
         return True, best_match
-    return False, {"reason": "未完全滿足突破頸線與量縮回測條件"}
+    return False, {"reason": "未完全滿足突破頸線與及時量縮回測條件"}
 
 
 def check_market_filter(
