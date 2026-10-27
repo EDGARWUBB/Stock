@@ -9,8 +9,10 @@ def plot_stock_kline(
     name: str = "", 
     signals: Optional[List[str]] = None,
     days: int = 60,
+    pullback_info: Optional[Dict[str, Any]] = None,
+    timeframe: str = "daily",  # "daily" (日K) 或 "weekly" (週K)
     w_bottom_info: Optional[Dict[str, Any]] = None,
-    timeframe: str = "daily"  # "daily" (日K) 或 "weekly" (週K)
+    **kwargs
 ) -> go.Figure:
     """
     使用 Plotly 繪製台股 K 線圖與成交量圖，具備現代化觸控手勢縮放與平移 (Pan & Zoom)
@@ -23,8 +25,7 @@ def plot_stock_kline(
     - 均線 (MA5, MA10, MA20, MA60) 自適應日/週週期標籤
     - 成交量柱狀圖 (量能紅綠配合 K 線)
     - 均量線 (Vol_MA5)
-    - 觸發訊號標記箭頭
-    - W 底型態標註: 頸線 (Neckline)、雙底圓點 (L1/L2)、等幅測距目標價
+    - 突破頸線與量縮回測特徵標註 (頸線水平虛線、突破點、回測支撐點)
     - 手勢操作優化:
       * dragmode='pan': 手機單指滑動或滑鼠拖曳直接「平移滑動」
       * 底部時間導航滑桿 (Rangeslider): 支援手勢雙向拉動縮放
@@ -149,14 +150,15 @@ def plot_stock_kline(
             row=1, col=1
         )
 
-    # 2.5 策略 D: W 底（雙重底）特徵繪製 (僅在日K模式下標註)
-    if w_bottom_info and not is_weekly:
-        neck_p = w_bottom_info.get("neckline_price")
-        l1_p = w_bottom_info.get("l1_price")
-        l1_d = str(w_bottom_info.get("l1_date", ""))
-        l2_p = w_bottom_info.get("l2_price")
-        l2_d = str(w_bottom_info.get("l2_date", ""))
-        tgt_p = w_bottom_info.get("target_price")
+    # 2.5 突破頸線量縮回測特徵標註 (僅在日K模式下標註)
+    info = pullback_info or w_bottom_info
+    if info and not is_weekly:
+        neck_p = info.get("neckline_price")
+        b_d = str(info.get("breakout_date", ""))
+        b_h = info.get("breakout_high")
+        pb_d = str(info.get("pullback_low_date", ""))
+        pb_low = info.get("pullback_min_low")
+        dist_pct = info.get("dist_to_neck_pct", 0.0)
 
         # 繪製頸線 (Neckline) 橘色虛線
         if neck_p and len(date_strs) > 0:
@@ -183,57 +185,40 @@ def plot_stock_kline(
                 row=1, col=1
             )
 
-        # 繪製 L1（左腳）與 L2（右腳）圓點標註
-        scatter_x = []
-        scatter_y = []
-        scatter_text = []
-        if l1_d in date_strs and l1_p:
-            scatter_x.append(l1_d)
-            scatter_y.append(l1_p)
-            scatter_text.append(f"<b>L1 左腳</b><br>{l1_p:.2f}元")
-        if l2_d in date_strs and l2_p:
-            scatter_x.append(l2_d)
-            scatter_y.append(l2_p)
-            scatter_text.append(f"<b>L2 右腳</b><br>{l2_p:.2f}元")
+        # 標記突破點與回測點
+        marker_x = []
+        marker_y = []
+        marker_text = []
+        marker_color = []
+        marker_symbol = []
 
-        if scatter_x:
+        if b_d in date_strs and b_h:
+            marker_x.append(b_d)
+            marker_y.append(b_h)
+            marker_text.append(f"<b>🚀 帶量突破</b><br>{b_h:.2f}元")
+            marker_color.append("#E74C3C")
+            marker_symbol.append("triangle-up")
+
+        if pb_d in date_strs and pb_low:
+            marker_x.append(pb_d)
+            marker_y.append(pb_low)
+            marker_text.append(f"<b>🟢 回測有撐</b><br>{pb_low:.2f}元 ({dist_pct:+.1f}%)")
+            marker_color.append("#27AE60")
+            marker_symbol.append("circle")
+
+        if marker_x:
             fig.add_trace(
                 go.Scatter(
-                    x=scatter_x,
-                    y=scatter_y,
+                    x=marker_x,
+                    y=marker_y,
                     mode="markers+text",
-                    name="W底雙腳 (L1 / L2)",
-                    marker=dict(symbol="circle", size=13, color="#8E44AD", line=dict(color="white", width=2)),
-                    text=scatter_text,
-                    textposition=["bottom center"] * len(scatter_x),
-                    textfont=dict(color="#8E44AD", size=11),
+                    name="突破與回測標記",
+                    marker=dict(symbol=marker_symbol, size=13, color=marker_color, line=dict(color="white", width=2)),
+                    text=marker_text,
+                    textposition=["top center" if s == "triangle-up" else "bottom center" for s in marker_symbol],
+                    textfont=dict(color=marker_color, size=11),
                     hoverinfo="text"
                 ),
-                row=1, col=1
-            )
-
-        # 繪製 W 底等幅測距目標價 綠色點線
-        if tgt_p and len(date_strs) > 0:
-            fig.add_shape(
-                type="line",
-                x0=date_strs[0],
-                x1=date_strs[-1],
-                y0=tgt_p,
-                y1=tgt_p,
-                line=dict(color="#27AE60", width=2, dash="dot"),
-                row=1, col=1
-            )
-            fig.add_annotation(
-                x=date_strs[-1],
-                y=tgt_p,
-                text=f"<b>🎯 W底等幅目標價: {tgt_p:.2f}元</b>",
-                showarrow=False,
-                xanchor="right",
-                yanchor="bottom",
-                font=dict(color="#196F3D", size=11),
-                bgcolor="rgba(234, 250, 234, 0.9)",
-                bordercolor="#27AE60",
-                borderwidth=1,
                 row=1, col=1
             )
 
@@ -297,7 +282,7 @@ def plot_stock_kline(
             x=0.02,
             y=0.98
         ),
-        dragmode="pan",  # 核心重點：讓單指觸控與滑鼠拖曳為平移滑動，避免變成擾人的方框選取
+        dragmode="pan",  # 讓單指觸控與滑鼠拖曳為平移滑動
         template="plotly_white",
         hovermode="x unified",
         margin=dict(l=45, r=45, t=50, b=30),

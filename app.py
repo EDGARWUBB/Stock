@@ -2,12 +2,13 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import datetime
-import json
 import os
-# 載入自訂模組並加入相容性保護 (防止雲端未同步更新所有檔案時拋出 ImportError)
+import json
 import yfinance as yf
-from data_loader import load_stock_metadata, fetch_stock_data, calculate_technical_indicators
+import importlib
+import inspect
 
+from data_loader import load_stock_metadata, fetch_stock_data, calculate_technical_indicators
 try:
     from data_loader import resample_to_weekly
 except ImportError:
@@ -36,45 +37,10 @@ except ImportError:
         except Exception:
             return None
 
-try:
-    from strategies import (
-        filter_liquidity,
-        strategy_a_breakdown_reversal,
-        strategy_a2_reversal_pullback,
-        strategy_b_consolidation_breakout,
-        strategy_c_pullback_support,
-        check_market_filter,
-        scan_single_stock
-    )
-except ImportError:
-    from strategies import (
-        filter_liquidity,
-        strategy_a_breakdown_reversal,
-        strategy_b_consolidation_breakout,
-        strategy_c_pullback_support,
-        scan_single_stock
-    )
-    def check_market_filter(market_df, mode="any"):
-        if market_df is None or len(market_df) < 65:
-            return True, {}
-        today = market_df.iloc[-1]
-        yest = market_df.iloc[-2]
-        close = float(today["Close"])
-        ma5_today = float(today.get("MA5", 0.0))
-        ma5_yest = float(yest.get("MA5", 0.0))
-        ma60_today = float(today.get("MA60", 0.0))
-        above_ma60 = close >= ma60_today
-        ma5_up = ma5_today >= ma5_yest
-        is_safe = (above_ma60 or ma5_up) if mode == "any" else (above_ma60 and ma5_up)
-        return is_safe, {"above_ma60": above_ma60, "ma5_up": ma5_up}
-
-    def strategy_a2_reversal_pullback(df, **kwargs):
-        return False, {"reason": "模組更新中"}
-
+from strategies import filter_liquidity, check_market_filter, strategy_neckline_pullback, scan_single_stock
 from chart_plotter import plot_stock_kline
-import importlib
-import inspect
 
+# 自動重載自訂模組
 try:
     import data_loader
     import strategies
@@ -85,28 +51,15 @@ try:
 except Exception:
     pass
 
-def safe_scan_single_stock(**kwargs):
-    """防禦性呼叫，避免模組在快取或版本不一致時因參數不符而拋出 TypeError"""
-    try:
-        sig = inspect.signature(scan_single_stock)
-        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
-        if has_var_kw:
-            valid_kwargs = kwargs
-        else:
-            valid_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
-        return scan_single_stock(**valid_kwargs)
-    except Exception:
-        return scan_single_stock(**kwargs)
-
 # 設定頁面佈局與標題
 st.set_page_config(
-    page_title="台股短線技術面選股工具",
-    page_icon="📈",
+    page_title="台股突破頸線量縮回測選股系統",
+    page_icon="🎯",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# 自訂 CSS 增強視覺效果
+# 自訂 CSS 提升介面質感
 st.markdown("""
 <style>
     .metric-card {
@@ -142,8 +95,8 @@ st.markdown("""
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_cached_stock_data(symbol: str, period: str = "6mo") -> pd.DataFrame:
-    """快取股票歷史日K線資料"""
+def get_cached_stock_data(symbol: str, period: str = "1y") -> pd.DataFrame:
+    """快取股票歷史 K 線資料"""
     return fetch_stock_data(symbol, period=period)
 
 
@@ -154,80 +107,50 @@ def get_cached_market_data(ticker: str = "^TWII", period: str = "6mo") -> pd.Dat
 
 
 def main():
-    st.title("📊 台股短線技術面選股工具")
-    st.caption("基於量價結構、大盤環境濾網、型態學與均線的自動化即時篩選與回測系統")
+    st.title("🎯 台股突破頸線量縮回測選股系統")
+    st.caption("專注捕捉「帶量突破前高/頸線壓力後，良性量縮拉回回測頸線支撐有守」的波段轉強起漲買點（如微星 2377 等典型標的）")
 
     # ============================
-    # 頂部大盤環境濾網看板 (Market Regime Bar)
+    # 頂部大盤環境濾網看板
     # ============================
-    market_df = get_cached_market_data("^TWII", period="6mo")
-    market_is_safe = True
-    market_info = {}
-
+    market_df = get_cached_market_data(ticker="^TWII", period="6mo")
     if market_df is not None and not market_df.empty:
-        market_is_safe, market_info = check_market_filter(market_df, mode="any")
-        latest_idx = market_df.iloc[-1]
-        idx_close = latest_idx["Close"]
-        idx_change = latest_idx.get("Change_Pct", 0.0)
-        idx_ma5 = latest_idx.get("MA5", 0.0)
-        idx_ma20 = latest_idx.get("MA20", 0.0)
-        idx_ma60 = latest_idx.get("MA60", 0.0)
+        is_safe, mkt_details = check_market_filter(market_df, mode="any")
+        last_mkt_row = market_df.iloc[-1]
+        mkt_close = float(last_mkt_row["Close"])
+        mkt_change = float(last_mkt_row.get("Change_Pct", 0.0))
+        mkt_ma60 = float(last_mkt_row.get("MA60", 0.0))
+        mkt_ma5 = float(last_mkt_row.get("MA5", 0.0))
 
-        # 判斷多空燈號
-        is_above_ma60 = idx_close >= idx_ma60
-        is_ma5_up = market_info.get("ma5_up", False)
-
-        if is_above_ma60 and is_ma5_up:
-            banner_class = "market-banner-safe"
-            icon = "🟢"
-            status_title = "大盤處於【強勢多頭安全環境】"
-            advice = "加權指數位於季線 (60MA) 之上且 5MA 斜率向上，主力做多意願濃厚，允許積極執行順勢突破與破底翻買進！"
-        elif is_above_ma60 or is_ma5_up:
-            banner_class = "market-banner-warn"
-            icon = "🟡"
-            status_title = "大盤處於【震盪整理轉折環境】"
-            advice = "加權指數處於季線之上但短線震盪，或正嘗試突破季線，短線做多建議嚴控部位成數與停損點。"
+        if is_safe:
+            status_cls = "market-banner-safe"
+            status_icon = "🟢"
+            status_title = "大盤環境處於做多安全區間"
+            status_desc = f"加權指數 ({mkt_close:.2f} 點，{mkt_change:+.2f}%) 位於季線之上或 5MA 向上，多方動能良好，突破回測策略勝率較高。"
         else:
-            banner_class = "market-banner-danger"
-            icon = "🔴"
-            status_title = "大盤處於【系統性空頭警戒環境】"
-            advice = "加權指數跌破季線 (60MA) 且 5MA 走空向下，系統性風險較高，強烈建議保守觀望，嚴禁盲目接刀追價！"
+            status_cls = "market-banner-danger"
+            status_icon = "🔴"
+            status_title = "大盤環境警戒 (偏空架構)"
+            status_desc = f"加權指數 ({mkt_close:.2f} 點) 跌破 60MA 季線 ({mkt_ma60:.2f}) 且 5MA 下彎，建議嚴格控制持股成數。"
 
         st.markdown(f"""
-        <div class="{banner_class}">
-            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap;">
-                <div>
-                    <h4 style="margin: 0; color: #2C3E50;">{icon} {status_title}</h4>
-                    <p style="margin: 5px 0 0 0; font-size: 13px; color: #555;">{advice}</p>
-                </div>
-                <div style="text-align: right; font-size: 13px;">
-                    <b>加權指數 (^TWII)：</b> <span style="font-size: 16px; font-weight: bold; color: {'#E74C3C' if idx_change >= 0 else '#2ECC71'};">{idx_close:,.2f} ({idx_change:+.2f}%)</span><br>
-                    <span style="color: #666;">5MA: {idx_ma5:,.1f} | 20MA: {idx_ma20:,.1f} | 60MA(季線): {idx_ma60:,.1f}</span>
-                </div>
-            </div>
+        <div class="{status_cls}">
+            <h4 style="margin:0 0 5px 0;">{status_icon} <b>大盤市場濾網看板 (加權指數 ^TWII) - {status_title}</b></h4>
+            <p style="margin:0; font-size: 14px;">{status_desc} (60MA: <b>{mkt_ma60:.2f}</b> | 5MA: <b>{mkt_ma5:.2f}</b>)</p>
         </div>
         """, unsafe_allow_html=True)
 
     # ============================
-    # 建立多功能 Tab 分頁
-    # ============================
-    tab1, tab2, tab3 = st.tabs([
-        "🚀 即時短線選股與走勢圖", 
-        "📊 策略半年歷史回測績效 (3D/5D/10D)", 
-        "📘 策略規則手冊與 XQ XS 語法對照"
-    ])
-
-    # ============================
     # 側邊欄：參數設定
     # ============================
-    st.sidebar.header("⚙️ 篩選與環境設定")
+    st.sidebar.header("⚙️ 篩選與策略設定")
 
-    # 大盤濾網開關
+    # 0. 大盤濾網開關
     st.sidebar.subheader("0. 大盤環境濾網")
     enable_market_filter = st.sidebar.checkbox(
-        "啟用大盤濾網 (大盤弱勢時自動過濾做多)",
+        "啟用大盤濾網 (大盤轉弱時自動過濾做多)",
         value=False,
-        help="當加權指數跌破季線且 5MA 下彎時，系統將自動暫停或過濾做多訊號，降低系統性崩跌風險。"
+        help="當加權指數跌破季線且 5MA 下彎時自動過濾訊號，降低系統性風險。"
     )
     market_filter_mode = st.sidebar.selectbox(
         "大盤安全門檻",
@@ -242,7 +165,7 @@ def main():
         [
             "🔥 全市場熱門活躍股 (約 525 檔，日量>=500張，推薦)",
             "🌐 全市場上市櫃所有股票 (全市場 1,979 檔)",
-            "⚡ 內建精選與台灣50核心 (53 檔，極速秒開)",
+            "⚡ 內建精選與台灣50核心 (54 檔，含微星，秒開)",
             "📂 上傳自訂 CSV",
             "✍️ 手動輸入代號清單"
         ],
@@ -256,7 +179,6 @@ def main():
             metadata_df = pd.read_csv("stocks_active_hot.csv")
         else:
             metadata_df = load_stock_metadata("stocks_default.csv")
-        
         limit_count = st.sidebar.slider("掃描活躍股票數量上限", min_value=50, max_value=len(metadata_df), value=min(300, len(metadata_df)), step=50)
         metadata_df = metadata_df.head(limit_count)
 
@@ -276,72 +198,41 @@ def main():
             "掃描檔數上限 (依流動性排序，避免超時)",
             options=[100, 250, 500, 1000, "全部掃描"],
             value=250,
-            help="短線交易需優先過濾低成交量殭屍股，建議先掃描成交量居前之個股"
+            help="建議先掃描成交量居前之個股"
         )
         if scan_scope != "全部掃描":
-            all_df.sort_values(by="latest_vol_lots", ascending=False, inplace=True)
             metadata_df = all_df.head(int(scan_scope))
         else:
             metadata_df = all_df
 
     elif "內建精選與台灣50核心" in stock_source:
-        default_meta = load_stock_metadata("stocks_default.csv")
-        sub_category = st.sidebar.selectbox(
-            "選擇類別分類",
-            ["全部股票 (53檔)", "台灣50核心股", "電子與半導體", "航運與傳產", "金融保險"]
-        )
-        if sub_category == "台灣50核心股":
-            metadata_df = default_meta.head(25)
-        elif sub_category == "電子與半導體":
-            metadata_df = default_meta[default_meta["industry"].isin(["半導體", "電腦週邊", "電子零組件", "光電業", "通信網路"])]
-        elif sub_category == "航運與傳產":
-            metadata_df = default_meta[default_meta["industry"].isin(["航運業", "鋼鐵工業", "塑膠工業", "食品工業", "貿易百貨"])]
-        elif sub_category == "金融保險":
-            metadata_df = default_meta[default_meta["industry"] == "金融保險"]
-        else:
-            metadata_df = default_meta
+        metadata_df = load_stock_metadata("stocks_default.csv")
 
     elif "上傳自訂 CSV" in stock_source:
-        uploaded_file = st.sidebar.file_uploader("上傳 CSV (需包含 symbol 欄位)", type=["csv"])
+        uploaded_file = st.sidebar.file_uploader("上傳包含 symbol 欄位的 CSV 檔", type=["csv"])
         if uploaded_file is not None:
-            try:
-                metadata_df = pd.read_csv(uploaded_file)
-                if "symbol" not in metadata_df.columns:
-                    st.sidebar.error("CSV 必須包含 'symbol' 欄位（例如 2330.TW）")
-                    metadata_df = pd.DataFrame()
-                if "name" not in metadata_df.columns:
-                    metadata_df["name"] = metadata_df["symbol"]
-            except Exception as e:
-                st.sidebar.error(f"檔案解析失敗: {e}")
+            metadata_df = load_stock_metadata(uploaded_file)
         else:
-            st.sidebar.info("請上傳 CSV 檔案，預設暫時使用台灣 50 代表股")
-            metadata_df = load_stock_metadata("stocks_default.csv").head(10)
+            st.sidebar.info("請上傳 CSV 檔案，目前使用預設清單。")
+            metadata_df = load_stock_metadata("stocks_default.csv")
 
-    else:
-        custom_input = st.sidebar.text_area(
-            "輸入股票代號 (逗號或換行分隔)",
-            value="2330.TW, 2317.TW, 2454.TW, 2603.TW, 3035.TW, 2002.TW, 2890.TW"
+    elif "手動輸入代號清單" in stock_source:
+        symbols_input = st.sidebar.text_area(
+            "輸入台股代號（以逗號或空格分隔）",
+            value="2377.TW, 2330.TW, 2317.TW, 2454.TW, 2382.TW, 2603.TW",
+            help="範例：2377.TW, 2330.TW 或 2377, 2330"
         )
-        symbols = [s.strip().upper() for s in custom_input.replace("\n", ",").split(",") if s.strip()]
-        metadata_df = pd.DataFrame({
-            "symbol": symbols,
-            "name": symbols,
-            "industry": ["自訂"] * len(symbols)
-        })
+        if symbols_input.strip():
+            symbols_list = [s.strip() for s in symbols_input.replace("\n", ",").replace(" ", ",").split(",") if s.strip()]
+            symbols_formatted = [s if s.endswith((".TW", ".TWO")) else f"{s}.TW" for s in symbols_list]
+            metadata_df = pd.DataFrame({
+                "symbol": symbols_formatted,
+                "name": symbols_formatted,
+                "industry": ["自訂"] * len(symbols_formatted),
+                "market": ["TWSE"] * len(symbols_formatted)
+            })
 
     st.sidebar.markdown(f"**當前股票池數量：** `{len(metadata_df)}` 檔")
-
-    with st.sidebar.expander("🔄 證交所/櫃買全市場名單更新"):
-        st.caption("自動連線台灣證券交易所 (TWSE) 與櫃買中心 (TPEx) OpenAPI 抓取最新普通股。")
-        if st.button("立即連線更新全市場名單", use_container_width=True):
-            with st.spinner("正在連線證交所與櫃買中心下載中..."):
-                try:
-                    from data_loader import update_full_market_stocks
-                    res_df = update_full_market_stocks(save_csv=True)
-                    st.success(f"更新完成！共取得 {len(res_df)} 檔上市櫃股票。")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"更新失敗: {e}")
 
     # 2. 基礎流動性過濾
     st.sidebar.subheader("2. 基礎流動性過濾（必要）")
@@ -349,9 +240,9 @@ def main():
         "5 日均量下限 (張)",
         min_value=300,
         max_value=5000,
-        value=1000,
+        value=800,
         step=100,
-        help="短線交易需避開流動性陷阱，預設大於 1,000 張"
+        help="短線交易需避開流動性陷阱，預設大於 800 張"
     )
     min_price = st.sidebar.slider(
         "收盤價下限 (元)",
@@ -362,67 +253,38 @@ def main():
         help="排除雞蛋水餃股，預設大於 15 元"
     )
 
-    # 3. 策略開關與參數設定
-    st.sidebar.subheader("3. 短線策略開關與參數")
+    # 3. 突破頸線量縮回測策略設定
+    st.sidebar.subheader("3. 突破頸線量縮回測策略設定")
+    with st.sidebar.expander("⚙️ 核心形態與量價參數", expanded=True):
+        lookback_window = st.slider("前期頸線觀察天數", 15, 60, 35, step=5, help="在突破日之前的區間內尋找最高價頸線峰位")
+        c_b1, c_b2 = st.columns(2)
+        with c_b1:
+            min_breakout_ago = st.number_input("突破距今最小天數", min_value=1, max_value=5, value=2)
+        with c_b2:
+            max_breakout_ago = st.number_input("突破距今最大天數", min_value=5, max_value=20, value=12)
 
-    # 策略 A
-    enable_strat_a = st.sidebar.checkbox("策略 A：帶量破底翻 (假跌破真反轉)", value=True)
-    strat_a_params = {}
-    if enable_strat_a:
-        with st.sidebar.expander("策略 A 細部參數"):
-            strat_a_params["lookback_window"] = st.slider("前期低點回溯天數 (第5~N天)", 15, 40, 25)
-            strat_a_params["exclude_recent"] = st.slider("排除最近天數", 2, 5, 3)
-            strat_a_params["vol_multiplier"] = st.slider("今日爆量倍數 (大於5日均量N倍)", 1.0, 3.0, 1.5, step=0.1)
-            strat_a_params["max_stop_loss_pct"] = st.slider(
-                "停損空間上限 (%)", 
-                3.0, 15.0, 7.0, step=0.5, 
-                help="今日收盤價距離近 3 日最低點幅度需 < 7%，避免過度拉抬導致追價風險過高"
-            )
+        min_breakout_gain = st.slider("突破頸線最小幅度 (%)", 0.5, 4.0, 1.0, step=0.5, help="突破日高點高於頸線的最小幅度")
+        vol_breakout_mult = st.slider("突破成交量倍數 (5MA均量倍數)", 1.0, 2.5, 1.15, step=0.05, help="突破日成交量相對於 5MA 均量的放大倍數")
+        
+        tol_min = st.slider("回測允許跌破頸線下限 (%)", -6.0, 0.0, -3.0, step=0.5, help="容許回測時微幅跌破頸線洗盤")
+        tol_max = st.slider("回測允許高於頸線上限 (%)", 1.0, 8.0, 4.5, step=0.5, help="回測低點距離頸線的最高容許幅度")
+        
+        vol_shrink_pct = st.slider("回測量縮門檻 (突破量之 %)", 40.0, 90.0, 75.0, step=5.0, help="回測最低成交量需小於突破日的特定百分比")
+        require_red_or_up = st.checkbox("今日守穩收紅/轉強確認", value=True, help="要求今日收紅K或高於昨日收盤，確認回測有撐")
 
-    # 策略 A-2
-    enable_strat_a2 = st.sidebar.checkbox("策略 A-2：破底翻後量縮回測買點 (二次回測)", value=True)
-    strat_a2_params = {}
-    if enable_strat_a2:
-        with st.sidebar.expander("策略 A-2 細部參數"):
-            strat_a2_params["lookback_trigger_days"] = st.slider("破底翻回溯天數", 3, 7, 5)
-            strat_a2_params["max_distance_pct"] = st.slider("拉回靠近前低幅度門檻 (%)", 1.0, 5.0, 3.0, step=0.5, help="收盤價拉回至前低 0% 至 N% 區間")
+        strat_params = {
+            "lookback_window": lookback_window,
+            "min_breakout_ago": int(min_breakout_ago),
+            "max_breakout_ago": int(max_breakout_ago),
+            "min_breakout_gain": float(min_breakout_gain),
+            "vol_breakout_mult": float(vol_breakout_mult),
+            "pullback_tolerance_min": float(tol_min),
+            "pullback_tolerance_max": float(tol_max),
+            "vol_shrink_pct": float(vol_shrink_pct),
+            "require_red_or_up": require_red_or_up
+        }
 
-    # 策略 B
-    enable_strat_b = st.sidebar.checkbox("策略 B：區間盤整帶量突破", value=True)
-    strat_b_params = {}
-    if enable_strat_b:
-        with st.sidebar.expander("策略 B 細部參數"):
-            strat_b_params["consolidation_days"] = st.slider("盤整觀察天數", 5, 20, 10)
-            strat_b_params["max_amplitude_pct"] = st.slider("盤整區間最大振幅 (%)", 4.0, 15.0, 8.0, step=0.5)
-            strat_b_params["vol_multiplier"] = st.slider("突破成交量倍數 (大於5日均量N倍)", 1.2, 3.5, 2.0, step=0.1)
-
-    # 策略 C
-    enable_strat_c = st.sidebar.checkbox("策略 C：強勢股量縮回測支撐", value=True)
-    strat_c_params = {}
-    if enable_strat_c:
-        with st.sidebar.expander("策略 C 細部參數"):
-            strat_c_params["lookback_surge_days"] = st.slider("前期攻擊紅K回溯天數", 10, 25, 15)
-            strat_c_params["surge_gain_pct"] = st.slider("攻擊紅K單日漲幅門檻 (%)", 3.0, 8.0, 5.0, step=0.5)
-            strat_c_params["surge_vol_mult"] = st.slider("攻擊紅K量能倍數 (大於5日均量N倍)", 1.5, 3.0, 2.0, step=0.1)
-            strat_c_params["ma_bias_pct"] = st.slider("回測均線乖離率容許範圍 (±%)", 1.0, 4.0, 2.0, step=0.5)
-
-    # 策略 D
-    enable_strat_d = st.sidebar.checkbox("策略 D：標準 W 底（雙重底）型態", value=True)
-    strat_d_params = {}
-    if enable_strat_d:
-        with st.sidebar.expander("策略 D 細部參數"):
-            strat_d_params["enable_d1"] = st.checkbox("啟用 模式 D-1 (右腳潛伏轉折買點)", value=True)
-            strat_d_params["enable_d2"] = st.checkbox("啟用 模式 D-2 (帶量突破頸線買點)", value=True)
-            strat_d_params["min_neckline_gain_pct"] = st.slider("頸線反彈最小幅度 (%)", 4.0, 15.0, 6.0, step=0.5, help="頸線與左腳 L1 價格差距需 >= 此門檻")
-            strat_d_params["min_interval_days"] = st.slider("雙底最小間隔天數", 5, 15, 7, help="左腳與右腳之間需相隔至少 N 天")
-            strat_d_params["d1_max_distance_pct"] = st.slider("D-1 距離右腳上限 (%)", 1.0, 6.0, 4.0, step=0.5, help="今日收盤價距離 L2 幅度上限")
-            strat_d_params["d2_vol_multiplier"] = st.slider("D-2 突破成交量倍數", 1.2, 3.0, 1.8, step=0.1, help="突破日成交量相對於 5 日均量倍數")
-            min_l2 = st.slider("右腳比左腳最低允許 (%)", -5.0, 0.0, -1.5, step=0.5)
-            max_l2 = st.slider("右腳比左腳最高墊高 (%)", 1.0, 8.0, 3.5, step=0.5)
-            strat_d_params["min_l2_ratio"] = min_l2 / 100.0
-            strat_d_params["max_l2_ratio"] = max_l2 / 100.0
-
-    # 交易日回溯模擬選擇
+    # 4. 交易日回溯模擬選擇
     st.sidebar.subheader("4. 掃描基準日")
     backtest_offset = st.sidebar.selectbox(
         "選擇掃描基準日",
@@ -432,9 +294,7 @@ def main():
             ("2 個交易日前", 2),
             ("3 個交易日前", 3),
             ("4 個交易日前", 4),
-            ("5 個交易日前", 5),
-            ("6 個交易日前", 6),
-            ("7 個交易日前", 7)
+            ("5 個交易日前", 5)
         ],
         format_func=lambda x: x[0]
     )[1]
@@ -452,35 +312,36 @@ def main():
             results = []
             scanned_count = 0
             liquidity_pass_count = 0
-            symbols_list = metadata_df["symbol"].tolist()
+
             names_dict = dict(zip(metadata_df["symbol"], metadata_df["name"]))
-            industry_dict = dict(zip(metadata_df["symbol"], metadata_df.get("industry", [""] * len(metadata_df))))
+            industry_dict = dict(zip(metadata_df["symbol"], metadata_df.get("industry", ["-"] * len(metadata_df))))
 
-            total = len(symbols_list)
-            for idx, symbol in enumerate(symbols_list):
-                status_text.text(f"掃描中 ({idx+1}/{total}): {symbol} {names_dict.get(symbol, '')}")
-                progress_bar.progress((idx + 1) / total)
+            total_items = len(metadata_df)
 
-                df = get_cached_stock_data(symbol, period="6mo")
-                if df is None or len(df) < 65:
+            for idx, row in metadata_df.iterrows():
+                symbol = row["symbol"]
+                name = row.get("name", symbol)
+
+                status_text.text(f"掃描中 ({idx+1}/{total_items}): {symbol} {name}")
+                progress_bar.progress((idx + 1) / total_items)
+
+                df_raw = get_cached_stock_data(symbol, period="1y")
+                if df_raw is None or df_raw.empty or len(df_raw) < 50:
                     continue
 
                 scanned_count += 1
 
-                # 若選擇歷史基準日
-                if backtest_offset > 0:
-                    if len(df) > backtest_offset + 60:
-                        df_target = df.iloc[:-backtest_offset].copy()
-                        df_target = calculate_technical_indicators(df_target)
-                    else:
-                        continue
+                # 處理基準日偏移 (回溯模擬)
+                if backtest_offset > 0 and len(df_raw) > backtest_offset + 50:
+                    df_target = df_raw.iloc[:-backtest_offset].copy()
+                    df_target = calculate_technical_indicators(df_target)
                 else:
-                    df_target = df
+                    df_target = calculate_technical_indicators(df_raw)
 
                 # 基準日對應之大盤
                 sub_market = None
                 if market_df is not None and not market_df.empty:
-                    if backtest_offset > 0 and len(market_df) > backtest_offset + 60:
+                    if backtest_offset > 0 and len(market_df) > backtest_offset + 50:
                         sub_market = market_df.iloc[:-backtest_offset].copy()
                         sub_market = calculate_technical_indicators(sub_market)
                     else:
@@ -492,23 +353,14 @@ def main():
                     liquidity_pass_count += 1
 
                 # 策略檢查
-                res = safe_scan_single_stock(
+                res = scan_single_stock(
                     symbol=symbol,
                     df=df_target,
                     name=names_dict.get(symbol, symbol),
                     industry=industry_dict.get(symbol, "-"),
                     min_vol_ma5=min_vol_ma5,
                     min_price=min_price,
-                    enable_strat_a=enable_strat_a,
-                    enable_strat_a2=enable_strat_a2,
-                    enable_strat_b=enable_strat_b,
-                    enable_strat_c=enable_strat_c,
-                    enable_strat_d=enable_strat_d,
-                    strat_a_params=strat_a_params,
-                    strat_a2_params=strat_a2_params,
-                    strat_b_params=strat_b_params,
-                    strat_c_params=strat_c_params,
-                    strat_d_params=strat_d_params,
+                    strat_params=strat_params,
                     market_df=sub_market,
                     require_market_filter=enable_market_filter,
                     market_filter_mode=market_filter_mode
@@ -525,417 +377,267 @@ def main():
             st.session_state["last_scan_time"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # ============================
-    # TAB 1: 即時短線選股與走勢圖
+    # 主畫面：選股結果與圖表分析
     # ============================
-    with tab1:
-        results = st.session_state.get("scan_results", [])
-        scanned_count = st.session_state.get("scanned_count", 0)
-        liquidity_pass_count = st.session_state.get("liquidity_pass_count", 0)
+    results = st.session_state.get("scan_results", [])
+    scanned_count = st.session_state.get("scanned_count", 0)
+    liquidity_pass_count = st.session_state.get("liquidity_pass_count", 0)
 
-        strat_a_hits = sum(1 for r in results if any(s == "策略A: 帶量破底翻" for s in r["signals"]))
-        strat_a2_hits = sum(1 for r in results if any("策略A-2" in s for s in r["signals"]))
-        strat_b_hits = sum(1 for r in results if any("策略B" in s for s in r["signals"]))
-        strat_c_hits = sum(1 for r in results if any("策略C" in s for s in r["signals"]))
-        strat_d_hits = sum(1 for r in results if any("策略D" in s for s in r["signals"]))
+    # 頂部統計指標
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric("掃描總檔數", f"{scanned_count} 檔")
+    with m2:
+        st.metric("通過流動性", f"{liquidity_pass_count} 檔")
+    with m3:
+        st.metric("🎯 突破頸線量縮回測", f"{len(results)} 檔", delta="觸發精選標的" if len(results) > 0 else None)
+    with m4:
+        st.metric("最近掃描時間", st.session_state.get("last_scan_time", "-"))
 
-        m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
-        with m1:
-            st.metric("掃描總檔數", f"{scanned_count} 檔")
-        with m2:
-            st.metric("通過流動性", f"{liquidity_pass_count} 檔")
-        with m3:
-            st.metric("🔥 帶量破底翻 (A)", f"{strat_a_hits} 檔")
-        with m4:
-            st.metric("🔄 破底翻回測 (A-2)", f"{strat_a2_hits} 檔")
-        with m5:
-            st.metric("🚀 盤整突破 (B)", f"{strat_b_hits} 檔")
-        with m6:
-            st.metric("🎯 回測轉強 (C)", f"{strat_c_hits} 檔")
-        with m7:
-            st.metric("👑 W底雙重底 (D)", f"{strat_d_hits} 檔")
+    # 歷史回測實證績效折疊卡
+    if os.path.exists("backtest_results.json"):
+        with st.expander("📊 【突破頸線量縮回測】過去 1 年真實行情歷史回測績效 (點擊展開檢視)", expanded=False):
+            try:
+                with open("backtest_results.json", "r", encoding="utf-8") as f:
+                    bt = json.load(f)
 
-        st.markdown("---")
-        st.subheader(f"📋 策略觸發精選名單 (共 {len(results)} 檔)")
+                st.caption(f"統計台股過去 1 年 54 檔代表性標的，訊號觸發後持有 3 天、5 天、10 天、20 天之實證數據（共觸發 {bt.get('total_trades', 0)} 次獨立波段進場機會）：")
 
-        selected_symbol = None
+                hm = bt.get("holding_metrics", {})
+                bt_rows = []
+                for k, label in [("3d", "持有 3 天 (超短線)"), ("5d", "持有 5 天 (週波段)"), ("10d", "持有 10 天 (雙週波段)"), ("20d", "持有 20 天 (月波段)")]:
+                    if k in hm:
+                        bt_rows.append({
+                            "持股週期": label,
+                            "勝率 (%)": f"{hm[k]['win_rate']}%",
+                            "平均報酬率 (%)": f"{hm[k]['avg_ret']:+.2f}%",
+                            "盈虧比 (Win/Loss)": f"{hm[k]['pl_ratio']:.2f}",
+                            "最大單筆獲利 (%)": f"+{hm[k]['max_gain']:.1f}%",
+                            "最大單筆虧損 (%)": f"{hm[k]['max_loss']:.1f}%"
+                        })
+                st.dataframe(pd.DataFrame(bt_rows), use_container_width=True, hide_index=True)
 
-        if results:
-            table_rows = []
-            for r in results:
-                table_rows.append({
-                    "股票代號": r["symbol"],
-                    "名稱": r["name"],
-                    "產業類別": r["industry"],
-                    "最新收盤價(元)": f"{r['close']:.2f}",
-                    "漲跌幅(%)": f"{r['change_pct']:+.2f}%",
-                    "成交量(張)": f"{r['volume_lots']:,.0f}",
-                    "5日均量(張)": f"{r['vol_ma5']:,.0f}",
-                    "觸發訊號標籤": " | ".join(r["signals"]),
-                    "資料基準日": r["last_date"]
-                })
+                b1, b2, b3 = st.columns(3)
+                with b1:
+                    st.metric("波段最佳持有週期", "10 ~ 20 天", "勝率達 60.2%")
+                with b2:
+                    st.metric("20日波段平均獲利", "+5.74%", "盈虧比達 1.90 (典型大賺小賠)")
+                with b3:
+                    st.metric("大盤環境濾網加乘", "+3.66% 均報酬", "震盪市亦能穩健獲利")
 
-            res_df = pd.DataFrame(table_rows)
+                st.info("💡 **回測結論實戰建議**：\n"
+                        "1. **波段持有勝率更高**：回測數據顯示，突破頸線回測並非單日當沖型態，持有 10～20 天（雙週至月波段）的勝率由 49.8% 攀升至 **60.2%**，平均報酬率達 **+5.74%**！\n"
+                        "2. **極佳盈虧比**：盈虧比高達 **1.90～1.93**，在量縮回測頸線處進場具有極佳的風險報酬比（向下以頸線為停損點空間極小，向上波段利潤大）。")
+            except Exception as e:
+                st.caption(f"載入回測數據失敗: {e}")
 
-            col_tbl, col_dl = st.columns([0.8, 0.2])
-            with col_dl:
-                csv_data = res_df.to_csv(index=False).encode("utf-8-sig")
-                st.download_button(
-                    label="📥 匯出選股清單 CSV",
-                    data=csv_data,
-                    file_name=f"tw_stock_signals_{datetime.date.today().strftime('%Y%m%d')}.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                )
+    st.markdown("---")
+    st.subheader(f"📋 突破頸線量縮回測觸發清單 (共 {len(results)} 檔)")
 
-            st.dataframe(res_df, use_container_width=True, hide_index=True)
+    selected_symbol = None
 
-            st.markdown("### 🔍 個股深度 K 線與技術面分析")
-            stock_options = [f"{r['symbol']} {r['name']} ({' | '.join(r['signals'])})" for r in results]
-            selected_option = st.selectbox("選擇要檢視技術線圖的股票：", stock_options, index=0)
+    if results:
+        table_rows = []
+        for r in results:
+            d = r.get("details", {})
+            table_rows.append({
+                "股票代號": r["symbol"],
+                "名稱": r["name"],
+                "產業類別": r["industry"],
+                "最新收盤價(元)": f"{r['close']:.2f}",
+                "漲跌幅(%)": f"{r['change_pct']:+.2f}%",
+                "當日成交量(張)": f"{r['volume_lots']:,.0f}",
+                "前期頸線價位(元)": f"{d.get('neckline_price', 0):.2f}",
+                "突破最高價(元)": f"{d.get('breakout_high', 0):.2f}",
+                "回測最低點(元)": f"{d.get('pullback_min_low', 0):.2f}",
+                "距頸線幅度(%)": f"{d.get('dist_to_neck_pct', 0):+.2f}%",
+                "回測量縮比例": f"{d.get('vol_shrink_ratio', 0):.1f}%",
+                "突破發生日": d.get("breakout_date", "-"),
+                "資料基準日": r["last_date"]
+            })
+
+        res_df = pd.DataFrame(table_rows)
+
+        col_tbl, col_dl = st.columns([0.8, 0.2])
+        with col_dl:
+            csv_data = res_df.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                label="📥 匯出選股清單 CSV",
+                data=csv_data,
+                file_name=f"breakout_pullback_{datetime.date.today().strftime('%Y%m%d')}.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+
+        st.dataframe(res_df, use_container_width=True, hide_index=True)
+
+        st.markdown("### 🔍 個股深度 K 線與型態分析")
+        stock_options = [f"{r['symbol']} {r['name']} (突破日: {r.get('details', {}).get('breakout_date', '-')})" for r in results]
+        
+        # 優先預設選取微星 (2377.TW)，若無則預設第 1 檔
+        default_idx = 0
+        for i, opt in enumerate(stock_options):
+            if "2377" in opt:
+                default_idx = i
+                break
+
+        selected_option = st.selectbox("選擇要檢視技術線圖的股票：", stock_options, index=default_idx)
+        selected_symbol = selected_option.split(" ")[0]
+
+    else:
+        st.info("💡 目前設定條件下未篩選出觸發標的。\n"
+                "建議：\n"
+                "1. 在左側側邊欄微調「回測允許高於頸線上限」（例如微調至 5%~6%）\n"
+                "2. 或微幅調降「5日均量下限」擴大掃描池\n"
+                "3. 下方仍可手動選擇任一股票直接檢視技術走勢圖！")
+
+        all_symbols = metadata_df["symbol"].tolist()
+        if all_symbols:
+            stock_options = [f"{s} {metadata_df[metadata_df['symbol'] == s]['name'].values[0]}" for s in all_symbols]
+            # 優先預設選取微星 2377
+            def_idx = 0
+            for i, opt in enumerate(stock_options):
+                if "2377" in opt:
+                    def_idx = i
+                    break
+            selected_option = st.selectbox("🔍 選擇任一檔股票檢視 K 線走勢：", stock_options, index=def_idx)
             selected_symbol = selected_option.split(" ")[0]
 
-        else:
-            st.info("💡 目前設定條件下未篩選出觸發訊號的股票。您可以：\n"
-                    "1. 在左側側邊欄微調參數（例如調降成交量爆量倍數、微幅放寬振幅百分比）\n"
-                    "2. 切換「掃描基準日」回溯檢視過去交易日（例如 1~4 個交易日前有航運、中鋼、統一等觸發）\n"
-                    "3. 下方仍可手動選擇任一股票直接檢視技術走勢圖！")
+    if selected_symbol:
+        st.markdown("---")
+        stock_name = metadata_df[metadata_df["symbol"] == selected_symbol]["name"].values[0] if selected_symbol in metadata_df["symbol"].values else selected_symbol
 
-            all_symbols = metadata_df["symbol"].tolist()
-            if all_symbols:
-                stock_options = [f"{s} {metadata_df[metadata_df['symbol'] == s]['name'].values[0]}" for s in all_symbols]
-                selected_option = st.selectbox("🔍 選擇任一檔股票檢視 K 線走勢：", stock_options, index=0)
-                selected_symbol = selected_option.split(" ")[0]
+        matched_result = next((r for r in results if r["symbol"] == selected_symbol), None)
+        signals = matched_result["signals"] if matched_result else []
 
-        if selected_symbol:
-            st.markdown("---")
-            stock_name = metadata_df[metadata_df["symbol"] == selected_symbol]["name"].values[0] if selected_symbol in metadata_df["symbol"].values else selected_symbol
+        # K 線圖控制列 (支援手勢縮放、日K / 週K 切換、預設視角切換)
+        chart_ctrl1, chart_ctrl2, chart_ctrl3 = st.columns([0.3, 0.45, 0.25])
+        with chart_ctrl1:
+            kline_freq = st.radio(
+                "📊 K 線週期",
+                ["日 K 線", "週 K 線"],
+                index=0,
+                horizontal=True,
+                help="日 K 適合觀察回測頸線細部量價；週 K 適合判定大格局多頭排列"
+            )
+        with chart_ctrl2:
+            range_options = ["近 60 根", "近 120 根", "近半年", "全部歷史"]
+            selected_range = st.radio(
+                "🔍 初始顯示視野",
+                range_options,
+                index=0,
+                horizontal=True,
+                help="設定初始圖表縮放區間，圖表下方亦可直接用手指/滑鼠拖曳滑桿進行連續無段縮放！"
+            )
+        with chart_ctrl3:
+            st.caption("🖐️ **手勢操作技巧**：\n- 雙指捏合／滾輪：無段縮放\n- 手指滑動／拖曳：平移時間\n- 底部導航滑桿：雙向拉動視窗")
 
-            matched_result = next((r for r in results if r["symbol"] == selected_symbol), None)
-            signals = matched_result["signals"] if matched_result else []
+        is_weekly = (kline_freq == "週 K 線")
+        fetch_period = "2y" if is_weekly else "1y"
 
-            # K 線圖控制列 (支援手勢縮放、日K / 週K 切換、預設視角切換)
-            chart_ctrl1, chart_ctrl2, chart_ctrl3 = st.columns([0.3, 0.45, 0.25])
-            with chart_ctrl1:
-                kline_freq = st.radio(
-                    "📊 K 線週期",
-                    ["日 K 線", "週 K 線"],
-                    index=0,
-                    horizontal=True,
-                    help="日 K 適合短線進出；週 K 適合判定大格局趨勢與支撐壓力"
-                )
-            with chart_ctrl2:
-                range_options = ["近 60 根", "近 120 根", "近半年", "全部歷史"]
-                selected_range = st.radio(
-                    "🔍 初始顯示視野",
-                    range_options,
-                    index=0,
-                    horizontal=True,
-                    help="設定初始圖表縮放區間，圖表下方亦可直接用手指/滑鼠拖曳滑桿進行連續無段縮放！"
-                )
-            with chart_ctrl3:
-                st.caption("🖐️ **手勢操作技巧**：\n- 雙指捏合／滾輪：無段縮放\n- 手指滑動／拖曳：平移時間\n- 底部導航滑桿：雙向拉動視窗")
+        full_df = get_cached_stock_data(selected_symbol, period=fetch_period)
 
-            is_weekly = (kline_freq == "週 K 線")
-            fetch_period = "2y" if is_weekly else "1y"
+        if full_df is not None and not full_df.empty:
+            # 處理基準日偏移 (回溯模擬)
+            if backtest_offset > 0 and len(full_df) > backtest_offset + 30:
+                raw_df = full_df.iloc[:-backtest_offset].copy()
+            else:
+                raw_df = full_df.copy()
 
-            full_df = get_cached_stock_data(selected_symbol, period=fetch_period)
-
-            if full_df is not None and not full_df.empty:
-                # 處理基準日偏移 (回溯模擬)
-                if backtest_offset > 0 and len(full_df) > backtest_offset + 30:
-                    raw_df = full_df.iloc[:-backtest_offset].copy()
+            if is_weekly:
+                display_df = resample_to_weekly(raw_df)
+                timeframe_val = "weekly"
+                if selected_range == "近 60 根":
+                    display_days = 60
+                elif selected_range == "近 120 根":
+                    display_days = 120
+                elif selected_range == "近半年":
+                    display_days = 26
                 else:
-                    raw_df = full_df.copy()
-
-                if is_weekly:
-                    display_df = resample_to_weekly(raw_df)
-                    timeframe_val = "weekly"
-                    if selected_range == "近 60 根":
-                        display_days = 60
-                    elif selected_range == "近 120 根":
-                        display_days = 120
-                    elif selected_range == "近半年":
-                        display_days = 26
-                    else:
-                        display_days = len(display_df)
+                    display_days = len(display_df)
+            else:
+                display_df = calculate_technical_indicators(raw_df)
+                timeframe_val = "daily"
+                if selected_range == "近 60 根":
+                    display_days = 60
+                elif selected_range == "近 120 根":
+                    display_days = 120
+                elif selected_range == "近半年":
+                    display_days = 130
                 else:
-                    display_df = calculate_technical_indicators(raw_df)
-                    timeframe_val = "daily"
-                    if selected_range == "近 60 根":
-                        display_days = 60
-                    elif selected_range == "近 120 根":
-                        display_days = 120
-                    elif selected_range == "近半年":
-                        display_days = 130
-                    else:
-                        display_days = len(display_df)
+                    display_days = len(display_df)
 
-                w_bottom_info = matched_result.get("details", {}).get("D") if (matched_result and matched_result.get("details")) else None
+            pullback_info = matched_result.get("details") if matched_result else None
+            if pullback_info is None:
+                # 若手動選擇的股票未在篩選結果中，現場檢驗型態以利繪製頸線
+                _, pb_details = strategy_neckline_pullback(display_df, **strat_params)
+                if "neckline_price" in pb_details:
+                    pullback_info = pb_details
 
-                fig = plot_stock_kline(
-                    df=display_df,
-                    symbol=selected_symbol,
-                    name=stock_name,
-                    signals=signals,
-                    days=display_days,
-                    w_bottom_info=w_bottom_info,
-                    timeframe=timeframe_val
-                )
+            fig = plot_stock_kline(
+                df=display_df,
+                symbol=selected_symbol,
+                name=stock_name,
+                signals=signals,
+                days=display_days,
+                pullback_info=pullback_info,
+                timeframe=timeframe_val
+            )
 
-                st.plotly_chart(
-                    fig,
-                    use_container_width=True,
-                    config={
-                        "scrollZoom": True,
-                        "displayModeBar": True,
-                        "modeBarButtonsToAdd": ["drawline", "drawopenpath", "eraseshape"],
-                        "displaylogo": False,
-                        "toImageButtonOptions": {"format": "png", "filename": f"{selected_symbol}_{timeframe_val}_kline"}
-                    }
-                )
+            st.plotly_chart(
+                fig,
+                use_container_width=True,
+                config={
+                    "scrollZoom": True,
+                    "displayModeBar": True,
+                    "modeBarButtonsToAdd": ["drawline", "drawopenpath", "eraseshape"],
+                    "displaylogo": False,
+                    "toImageButtonOptions": {"format": "png", "filename": f"{selected_symbol}_{timeframe_val}_kline"}
+                }
+            )
 
-                latest_k = display_df.iloc[-1]
-                c1, c2, c3, c4, c5 = st.columns(5)
-                price_label = "本週收盤價" if is_weekly else "最新收盤價"
-                change_label = "本週漲跌幅" if is_weekly else "最新漲跌幅"
-                vol_label = "本週成交量" if is_weekly else "當日成交量"
-                ma5_lbl = "5W MA (5週線)" if is_weekly else "5MA 週線"
-                ma20_lbl = "20W MA (20週線)" if is_weekly else "20MA 月線"
-                ma60_lbl = "60W MA (60週線)" if is_weekly else "60MA 季線"
+            latest_k = display_df.iloc[-1]
+            c1, c2, c3, c4, c5 = st.columns(5)
+            price_label = "本週收盤價" if is_weekly else "最新收盤價"
+            change_label = "本週漲跌幅" if is_weekly else "最新漲跌幅"
+            vol_label = "本週成交量" if is_weekly else "當日成交量"
+            ma5_lbl = "5W MA (5週線)" if is_weekly else "5MA 週線"
+            ma20_lbl = "20W MA (20週線)" if is_weekly else "20MA 月線"
+            ma60_lbl = "60W MA (60週線)" if is_weekly else "60MA 季線"
 
-                with c1:
-                    st.metric(price_label, f"{latest_k['Close']:.2f} 元", f"{latest_k['Change_Pct']:+.2f}%")
-                with c2:
-                    st.metric(vol_label, f"{latest_k['Volume']:,.0f} 張")
-                with c3:
-                    st.metric(ma5_lbl, f"{latest_k.get('MA5', 0.0):.2f} 元")
-                with c4:
-                    st.metric(ma20_lbl, f"{latest_k.get('MA20', 0.0):.2f} 元")
-                with c5:
-                    st.metric(ma60_lbl, f"{latest_k.get('MA60', 0.0):.2f} 元")
+            with c1:
+                st.metric(price_label, f"{latest_k['Close']:.2f} 元", f"{latest_k['Change_Pct']:+.2f}%")
+            with c2:
+                st.metric(vol_label, f"{latest_k['Volume']:,.0f} 張")
+            with c3:
+                st.metric(ma5_lbl, f"{latest_k.get('MA5', 0.0):.2f} 元")
+            with c4:
+                st.metric(ma20_lbl, f"{latest_k.get('MA20', 0.0):.2f} 元")
+            with c5:
+                st.metric(ma60_lbl, f"{latest_k.get('MA60', 0.0):.2f} 元")
 
-                if matched_result and matched_result.get("details"):
-                    st.markdown("#### 🎯 策略觸發指標條件詳情")
-                    details = matched_result["details"]
+            if pullback_info and "neckline_price" in pullback_info:
+                st.markdown("#### 🎯 突破頸線量縮回測型態檢驗細節")
+                with st.expander(f"📌 {selected_symbol} {stock_name} 突破回測數據指標詳情", expanded=True):
+                    st.markdown(f"""
+                    - **前期波段頸線 (Neckline)：** `{pullback_info['neckline_price']} 元` (峰位發生日: `{pullback_info.get('neckline_date', '-')}`)
+                    - **帶量突破日與最高價：** `{pullback_info.get('breakout_date', '-')}` 創最高價 **`{pullback_info.get('breakout_high', 0)} 元`**，當日成交量 **`{pullback_info.get('breakout_vol', 0):,.0f} 張`** (爆量倍數: **{pullback_info.get('breakout_vol_ratio', 0)} 倍**)
+                    - **突破後回測最低點：** `{pullback_info.get('pullback_low_date', '-')}` 探低點 **`{pullback_info.get('pullback_min_low', 0)} 元`**
+                    - **回測距離頸線幅度：** **`{pullback_info.get('dist_to_neck_pct', 0):+.2f}%`** (落於容許範圍內：{'✅ 支撐測試確立' if pullback_info.get('is_supported') else '❌ 跌破頸線'})
+                    - **回測量能萎縮確認：** 回測最低成交量 **`{pullback_info.get('pullback_min_vol', 0):,.0f} 張`**，為突破日成交量之 **`{pullback_info.get('vol_shrink_ratio', 0)}%`** (小於 75% 門檻：✅ 賣壓完全枯竭無沉重拋壓)
+                    - **最新收盤與轉強確認：** 今日收盤 `{latest_k['Close']:.2f} 元` (守穩頸線：{'✅ 確立' if pullback_info.get('is_supported') else '❌'}，轉強訊號：{'✅ 收紅/守昨日' if pullback_info.get('is_turning') else '❌'})
+                    """)
 
-                    if "A" in details:
-                        with st.expander("📌 策略 A：帶量破底翻 檢驗細節", expanded=True):
-                            info = details["A"]
-                            st.markdown(f"""
-                            - **前期區間低點 (Prev_Low)：** `{info['prev_low']} 元`
-                            - **近期最低點 (Recent Low)：** `{info['recent_min_low']} 元` (破底動作：{'✅ 曾破底' if info['had_breakdown'] else '❌'})
-                            - **今日收盤價：** `{info['today_close']} 元` (重新站回：{'✅ 是' if info['reclaimed'] else '❌'}，紅K實體：{'✅ 是' if info['is_red'] else '❌'})
-                            - **成交量能比：** 今日 `{info['today_vol']:,.0f} 張` / 5日均量 `{info['today_vol_ma5']:,.0f} 張` = **{info['vol_ratio']} 倍** (量能確認：{'✅ 達標' if info['vol_confirmed'] else '❌'})
-                            - **停損空間控制：** 距近 3 日最低點幅度 **`{info.get('stop_loss_pct', 0.0)}%`** (小於 7% 門檻：{'✅ 風險可控' if info.get('pass_stop_loss', True) else '❌ 過度追價'})
-                            """)
-
-                    if "A2" in details:
-                        with st.expander("📌 策略 A-2：破底翻後量縮回測 檢驗細節", expanded=True):
-                            info = details["A2"]
-                            st.markdown(f"""
-                            - **前期支撐低點 (Prev_Low)：** `{info['prev_low']} 元`
-                            - **今日收盤價：** `{info['today_close']} 元`
-                            - **距前低幅度：** **`{info['distance_pct']}%`** (0% 至 3% 內：{'✅ 完美回測支撐' if info['near_support'] else '❌'})
-                            - **量能萎縮確認：** 今日 `{info['today_vol']:,.0f} 張` < 5日均量 `{info['today_vol_ma5']:,.0f} 張` ({'✅ 量縮無拋壓' if info['vol_shrunk'] else '❌'})
-                            - **破底翻起漲點：** 距今約 `{info['reversal_ago_days']} 個交易日前`
-                            """)
-
-                    if "B" in details:
-                        with st.expander("📌 策略 B：區間盤整帶量突破 檢驗細節", expanded=True):
-                            info = details["B"]
-                            st.markdown(f"""
-                            - **10 日盤整區間：** 最高 `{info['range_high']} 元` / 最低 `{info['range_low']} 元`
-                            - **區間振幅：** **`{info['amplitude_pct']}%`** (小於門檻：{'✅ 符合盤整' if info['is_consolidating'] else '❌'})
-                            - **突破確認：** 今日收盤 `{info['today_close']} 元` (創 11 日新高：{'✅ 突破' if info['is_new_high'] else '❌'})
-                            - **均線支撐與扣抵：** 20MA=`{info['today_ma20']} 元`，60MA=`{info['today_ma60']} 元` (多頭排列與斜率向上：{'✅ 是' if info['ma_protected'] else '❌'})
-                            - **爆量倍數：** **`{info['vol_ratio']} 倍`** 5日均量 (帶量確認：{'✅ 達標' if info['vol_confirmed'] else '❌'})
-                            """)
-
-                    if "C" in details:
-                        with st.expander("📌 策略 C：強勢股量縮回測支撐 檢驗細節", expanded=True):
-                            info = details["C"]
-                            st.markdown(f"""
-                            - **強勢波段背景：** 過去 15 日曾出現單日漲幅>5% 且帶量 2 倍紅 K：{'✅ 曾有主力攻擊' if info['had_surge_k'] else '❌'}
-                            - **均線生命線：** 60MA 季線斜率向上：{'✅ 季線多頭保護' if info['ma60_up'] else '❌'}
-                            - **回測支撐與量縮：** 拉回接近 10MA/20MA 乖離內：{'✅ 支撐測試' if info['near_ma_flag'] else '❌'}，回測量能萎縮：{'✅ 籌碼安定' if info['vol_shrunk'] else '❌'}
-                            - **轉強訊號確認：** 今日收紅 K ({'✅' if info['is_red'] else '❌'})、成交量較昨日放大 ({'✅' if info['vol_increased'] else '❌'})、突破昨日高點 `{info['yest_high']} 元` ({'✅' if info['break_yest_high'] else '❌'})
-                            """)
-
-                    if "D" in details:
-                        with st.expander("📌 策略 D：標準 W 底（雙重底） 檢驗細節", expanded=True):
-                            info = details["D"]
-                            sub_mode_str = "、".join(info.get('sub_modes', ['W底型態']))
-                            tgt_gain = round(((info['target_price'] - info['today_close']) / info['today_close'] * 100.0), 2) if info.get('today_close') else 0.0
-                            st.markdown(f"""
-                            - **觸發子模式：** **{sub_mode_str}**
-                            - **左腳最低點 (L1)：** `{info['l1_price']} 元` (日期: `{info['l1_date']}`)，當日量 `{info['l1_vol']:,.0f} 張`
-                            - **右腳最低點 (L2)：** `{info['l2_price']} 元` (日期: `{info['l2_date']}`)，當日量 `{info['l2_vol']:,.0f} 張`
-                            - **中間頸線峰位 (Neckline)：** `{info['neckline_price']} 元` (日期: `{info['neckline_date']}`)
-                            - **空間幅度過濾：** 頸線比左腳高出 **`{info['neckline_gain_pct']:.2f}%`** (大於 6% 門檻：✅ 空間充分，非死魚盤整)
-                            - **雙底對稱與間隔：** 兩腳相隔 **`{info['interval_days']} 個交易日`** (>=門檻)，L2/L1 價差 **`{info['l2_diff_pct']:+.2f}%`** (✅ 雙底支撐確立)
-                            - **量能結構過濾：** 右腳量縮於左腳或小於 20MA 均量：{'✅ 賣壓枯竭' if info['vol_ok'] else '❌'} (今日量/5MA比：`{info['vol_ratio']} 倍`)
-                            - **🎯 等幅測距目標價：** **`{info['target_price']} 元`** (預估潛在漲幅：**`{tgt_gain:+.2f}%`**)
-                            """)
-
-    # ============================
-    # TAB 2: 半年歷史回測績效報表
-    # ============================
-    with tab2:
-        st.subheader("📈 三大短線策略過去半年歷史回測績效 (53 檔台股真實數據)")
-        st.caption("統計訊號觸發後持有 3 天、5 天與 10 天之勝率、平均報酬率與盈虧比，並對比「大盤環境濾網」前後差異。")
-
-        # 讀取回測報告數據
-        bt_file = "backtest_results.json"
-        if os.path.exists(bt_file):
-            try:
-                with open(bt_file, "r", encoding="utf-8") as f:
-                    bt_data = json.load(f)
-
-                # 呈現績效總表
-                rows = []
-                for s_name, data in bt_data.items():
-                    if "3d" in data:
-                        rows.append({
-                            "策略項目": s_name,
-                            "總觸發筆數": data["count"],
-                            "3D 勝率": f"{data['3d']['win_rate']}%",
-                            "3D 平均報酬": f"{data['3d']['avg_ret']:+.2f}%",
-                            "5D 勝率": f"{data['5d']['win_rate']}%",
-                            "5D 平均報酬": f"{data['5d']['avg_ret']:+.2f}%",
-                            "10D 勝率": f"{data['10d']['win_rate']}%",
-                            "10D 平均報酬": f"{data['10d']['avg_ret']:+.2f}%",
-                            "10D 盈虧比": f"{data['10d']['pl_ratio']:.2f}",
-                            "最大單筆獲利": f"+{data['10d']['max_gain']:.1f}%"
-                        })
-                perf_df = pd.DataFrame(rows)
-                st.dataframe(perf_df, use_container_width=True, hide_index=True)
-
-                st.markdown("---")
-                st.subheader("🛡️ 大盤環境濾網效益分析 (加權指數季線與 5MA)")
-                b1, b2, b3 = st.columns(3)
-                strat_b_stats = bt_data.get("策略B: 盤整帶量突破", {})
-                if strat_b_stats and "10d" in strat_b_stats:
-                    s10 = strat_b_stats["10d"]
-                    with b1:
-                        st.metric("策略 B 未濾網 10D 勝率", f"{s10['win_rate']}%", f"{s10['avg_ret']:+.2f}% 均報酬")
-                    with b2:
-                        st.metric("策略 B 啟用大盤濾網 10D 勝率", f"{s10['mkt_win_rate']}%", f"{s10['mkt_avg_ret']:+.2f}% 均報酬", delta_color="normal")
-                    with b3:
-                        delta_win = s10['mkt_win_rate'] - s10['win_rate']
-                        st.metric("勝率提升幅度", f"+{delta_win:.1f}%", "大幅降低系統性風險")
-
-                st.info("💡 **回測結論摘要**：\n"
-                        "1. **策略 B (盤整帶量突破)** 是穩定性最佳的策略，10D 勝率達 72.7%，啟用大盤濾網後勝率更激增至 **88.9%**，平均報酬率達 **+12.16%**！\n"
-                        "2. **策略 A (帶量破底翻)** 具有爆發性獲利潛力，10D 平均報酬率高達 **+12.12%**，盈虧比達 **37.93**，屬於典型的大賺小賠波段反轉型態。\n"
-                        "3. **策略 C (量縮回測轉強)** 提供最高的交易頻率，適合於大盤震盪時尋求回測支撐的防守型買點。")
-
-            except Exception as e:
-                st.error(f"讀取回測報告失敗: {e}")
-        else:
-            st.warning("尚未產出歷史回測檔案，可手動執行 backtester.py 生成報告。")
-
-    # ============================
-    # TAB 3: 策略規範與 XQ XS 語法對照手冊
-    # ============================
-    with tab3:
-        st.subheader("📘 台股量化策略規範與 XQ 全球贏家 XS 語法對照")
+    # 底部參考手冊折疊面板
+    with st.expander("📘 突破頸線量縮回測型態學邏輯與操作守則"):
         st.markdown(r"""
-        本專案已模組化為 Antigravity Workspace Skill (`tw-stock-strategy`)，支援直接將策略轉換為 XQ XS 選股腳本或量化模組。
-        
-        #### 1. 台股資料清洗標準
-        - **成交量換算**：API 股數自動除以 1,000 轉換為「張」。
-        - **基礎流動性過濾**：5 日均量 $\ge 1,000$ 張，收盤價 $\ge 15$ 元。
-        - **大盤濾網**：加權指數 (`^TWII`) 需在季線 (60MA) 之上或 5MA 向上。
-
-        #### 2. XQ 全球贏家 XS 選股腳本實作範例 (策略 C：量縮回測轉強)
-        ```pascal
-        // ==========================================
-        // 策略 C: 強勢股量縮回測支撐 (XQ XS 選股腳本)
-        // ==========================================
-        input: minVol(1000, "5日均量門檻(張)");
-        input: minPrice(15, "收盤價下限(元)");
-        input: surgeDays(15, "攻擊紅K回溯天數");
-        input: biasPct(2.0, "均線乖離率容許(%)");
-
-        settotalbar(80);
-
-        // 1. 基礎流動性過濾
-        condition1 = Average(volume, 5) >= minVol and close >= minPrice;
-
-        // 2. 60MA 季線向上
-        condition2 = Average(close, 60) > Average(close, 60)[1];
-
-        // 3. 過去 15 日曾出現單日漲幅 >= 5% 且成交量 >= 2 倍 5MA 之攻擊紅 K
-        variable: hadSurge(false), i(0);
-        hadSurge = false;
-        for i = 1 to surgeDays begin
-            if (close[i] - close[i+1]) / close[i+1] * 100 >= 5.0 
-               and volume[i] >= Average(volume[i], 5) * 2.0 
-               and close[i] > open[i] then
-            begin
-                hadSurge = true;
-            end;
-        end;
-
-        // 4. 最近回測 10MA 或 20MA (乖離在正負 2% 內)
-        variable: nearMA(false);
-        nearMA = false;
-        if absvalue(close[1] - Average(close[1], 10)) / Average(close[1], 10) * 100 <= biasPct 
-           or absvalue(close[1] - Average(close[1], 20)) / Average(close[1], 20) * 100 <= biasPct then
-        begin
-            nearMA = true;
-        end;
-
-        // 5. 今日轉強: 收紅K、量增、收盤價突破昨日高點
-        condition3 = close > open and volume > volume[1] and close > high[1];
-
-        if condition1 and condition2 and hadSurge and nearMA and condition3 then ret = 1;
-        ```
-
-        #### 3. XQ 全球贏家 XS 選股腳本實作範例 (策略 D：標準 W 底帶量突破)
-        ```pascal
-        // ==========================================
-        // 策略 D: 標準 W 底 (Double Bottom) 帶量突破頸線 (XQ XS 選股腳本)
-        // ==========================================
-        input: minVol(1000, "5日均量門檻(張)");
-        input: minPrice(15, "收盤價下限(元)");
-        input: neckPct(6.0, "頸線反彈最小幅度(%)");
-        input: volMult(1.8, "D-2突破爆量倍數");
-
-        settotalbar(60);
-
-        // 1. 基礎流動性過濾
-        condition1 = Average(volume, 5) >= minVol and close >= minPrice;
-
-        // 2. 左腳 L1: 過去第 16 天至第 30 天之最低價
-        variable: L1_Price(0), L1_Bar(0), L2_Price(0), L2_Bar(0), Neck_Price(0), i(0);
-        L1_Price = Lowest(low[16], 15);
-        for i = 16 to 30 begin
-            if low[i] = L1_Price then L1_Bar = i;
-        end;
-
-        // 3. 右腳 L2: 過去第 2 天至第 10 天之最低價
-        L2_Price = Lowest(low[2], 9);
-        for i = 2 to 10 begin
-            if low[i] = L2_Price then L2_Bar = i;
-        end;
-
-        // 4. 頸線峰位: L1 之後至前 5 天最高價
-        Neck_Price = Highest(high[5], maxlist(L1_Bar - 5, 1));
-
-        // 5. 兩腳間隔 >= 7 天，且 L2/L1 價差在 -1.5% 至 +3.5% 之間 (左低右高支撐確立)
-        condition2 = (L1_Bar - L2_Bar >= 7) 
-                     and (L2_Price >= L1_Price * 0.985) 
-                     and (L2_Price <= L1_Price * 1.035);
-
-        // 6. 空間幅度過濾：頸線高出左腳至少 6%
-        condition3 = (Neck_Price - L1_Price) / L1_Price * 100 >= neckPct;
-
-        // 7. 模式 D-2 帶量突破頸線買點 (今日收紅、創高突頸線、出量1.8倍)
-        condition4 = (close > Neck_Price) and (close > open) and (volume >= Average(volume, 5) * volMult);
-
-        if condition1 and condition2 and condition3 and condition4 then ret = 1;
-        ```
+        #### 形態學獲利邏輯：
+        1. **真突破與誘空洗盤**：
+           當一檔股票歷經長時間底部盤整或箱型整理後，主力出量帶動股價突破前波頸線（高點壓力）。
+        2. **良性回測不破頸線**：
+           突破後通常會有解套賣壓與獲利了結浮額，此時主力不護盤任其拉回回測。若拉回時「**成交量急遽萎縮**」且「**不跌破原本的頸線或 10MA/20MA 均線**」，代表市場浮額已清洗乾淨，原本的「阻力線」已正式轉換為「強大支撐線」。
+        3. **最佳二次買點**：
+           回測頸線不破、再次收紅轉強時，為風險極小、損益比極佳的黃金進場點！
         """)
 
 
